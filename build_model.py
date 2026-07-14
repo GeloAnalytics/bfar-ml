@@ -23,7 +23,8 @@ pre_features = [
   'G2:A_GSIS', 'G3:A_PhilHealth', 'G4:A_PN-IN', 'G5:A_LIFE-IN', 'G6:A_HEALTH-IN'
 ]
 
-df = pd.read_csv('../bfar.csv')
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+df = pd.read_csv(os.path.join(BASE_DIR, 'bfar.csv'))
 df['treatment'] = df['Y_BOAT-RE'].notna().astype(int)
 
 X = df[pre_features]
@@ -32,10 +33,11 @@ y = df['treatment']
 gb = GradientBoostingClassifier(n_estimators=100, learning_rate=0.1, max_depth=3, random_state=42)
 gb.fit(X, y)
 
-os.makedirs('models', exist_ok=True)
-joblib.dump(gb, 'models/gradient_boosting_ps_model.pkl')
+models_dir = os.path.join(BASE_DIR, 'models')
+os.makedirs(models_dir, exist_ok=True)
+joblib.dump(gb, os.path.join(models_dir, 'gradient_boosting_ps_model.pkl'))
 
-with open('models/pre_features.json', 'w') as f:
+with open(os.path.join(models_dir, 'pre_features.json'), 'w') as f:
     json.dump(pre_features, f)
 
 print("Model and features saved successfully.")

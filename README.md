@@ -2,34 +2,38 @@
 
 This service exposes endpoints that load artifacts generated from `psm.ipynb`:
 
-- `ml/models/pre_features.json`
-- `ml/models/gradient_boosting_ps_model.pkl`
+- `models/pre_features.json`
+- `models/gradient_boosting_ps_model.pkl`
 
 It provides:
 - `POST /predict_ps` : compute `ps_final` (propensity score) for input records
 - `POST /estimate_att` : run propensity-score matching and estimate ATT + CI
 
-## 1) Create / place model artifacts
+If this repo is dropped into another project as a subfolder (commonly named `ml/`), prefix the commands below with that folder (e.g. `pip install -r ml/requirements.txt`, `python ml/app.py`). All paths in `app.py`, `build_model.py`, and `train_model.py` resolve relative to their own file location, so it works the same whether this is the repo root or a nested subfolder — `bfar.csv` just needs to stay next to `build_model.py`/`train_model.py`.
 
-You can generate the required ML artifacts (`pre_features.json` and `gradient_boosting_ps_model.pkl`) automatically by running the included python scripts:
-- `cd ml`
-- `python build_model.py`
+## 1) Model artifacts
 
-This script reads `bfar.csv` from the parent directory and saves the generated model and feature list directly into the `ml/models/` directory.
+`models/gradient_boosting_ps_model.pkl` and `models/pre_features.json` are already committed to this repo, so **you can skip straight to step 2** for normal use.
 
-Alternatively, from `psm.ipynb` (or `ml/train_model.py`), export the artifacts into `ml/models/`. If you already saved these somewhere else, copy them into `ml/models/`.
+To regenerate them yourself (e.g. after changing `bfar.csv` or the feature list):
+```bash
+pip install -r requirements-dev.txt
+python build_model.py
+```
+This reads `bfar.csv` (same directory) and overwrites the two files in `models/`.
+
+Alternatively, export updated artifacts from `psm.ipynb` (or `train_model.py`) into `models/`.
 
 ## 2) Install Python dependencies
 
-From repo root, install:
 ```bash
-pip install -r ml/requirements.txt
+pip install -r requirements.txt
 ```
 
 ## 3) Start the Flask service
 
 ```bash
-python ml/app.py
+python app.py
 ```
 
 Default port: **8000** (same as controller default).
@@ -67,6 +71,6 @@ curl -X POST http://localhost:8000/estimate_att \
   }'
 ```
 
-**Note:** Every record must include *all* `pre_features` keys found in `ml/models/pre_features.json`, plus:
+**Note:** Every record must include *all* `pre_features` keys found in `models/pre_features.json`, plus:
 - `treatment`: 0 or 1
 - `outcome`: numeric outcome value (in the notebook it was `C5:TOT_INCOME/B`)

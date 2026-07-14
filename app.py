@@ -210,6 +210,11 @@ def logit(p):
     return np.log(p / (1 - p))
 
 
+def _json_safe_float(value):
+    """Converts NaN/inf to None so responses stay valid JSON for strict clients."""
+    return float(value) if np.isfinite(value) else None
+
+
 @app.route("/predict_ps", methods=["POST"])
 def predict_ps():
     if GB_MODEL is None:
@@ -376,14 +381,13 @@ def estimate_att():
         sample = diffs[rng.integers(0, m, size=m)]
         boot.append(np.mean(sample))
     ci_low, ci_high = np.percentile(np.asarray(boot), [2.5, 97.5])
-    ci_95 = [float(ci_low), float(ci_high)]
 
     return jsonify({
         "matched_pairs": int(len(matched_pairs)),
-        "att_mean": att_mean,
-        "ci_95": ci_95,
-        "p_value_paired_ttest": p_val,
-        "caliper": float(caliper)
+        "att_mean": _json_safe_float(att_mean),
+        "ci_95": [_json_safe_float(ci_low), _json_safe_float(ci_high)],
+        "p_value_paired_ttest": _json_safe_float(p_val),
+        "caliper": _json_safe_float(caliper)
     })
 
 

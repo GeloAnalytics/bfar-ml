@@ -3,8 +3,9 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 import math
+import os
 sns.set()
-df = pd.read_csv('../bfar.csv')
+df = pd.read_csv(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'bfar.csv'))
 df.info()
 df.head()
 # Pre-Program Features
