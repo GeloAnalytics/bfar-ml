@@ -174,6 +174,24 @@ def _leakage_correlated_columns(df, treatment_col, treatment_binarized, candidat
     return leaky
 
 
+def match_feature_columns(feature_cols, available_columns):
+    """
+    For each name in `feature_cols`, finds an exact or normalized-name match
+    in `available_columns`. Returns a dict {feature_name: matched_column_or_None}.
+    Used to check how much of an existing model's schema is actually present
+    in a freshly uploaded dataset, before deciding whether retraining is
+    even necessary.
+    """
+    available_norm = {_normalize_key(c): c for c in available_columns}
+    matches = {}
+    for name in feature_cols:
+        if name in available_columns:
+            matches[name] = name
+        else:
+            matches[name] = available_norm.get(_normalize_key(name))
+    return matches
+
+
 def select_top_features(df, treatment_col, treatment_binarized, top_n=30):
     """
     Fits a GradientBoostingClassifier on every numeric candidate column
@@ -182,6 +200,12 @@ def select_top_features(df, treatment_col, treatment_binarized, top_n=30):
     (top_n feature names, name->importance dict for every ranked candidate,
     sorted list of columns excluded as leakage-correlated).
     """
+    ranked, leaky = _rank_candidate_features(df, treatment_col, treatment_binarized)
+    top = ranked[:top_n]
+    return [name for name, _ in top], {name: json_safe_float(imp) for name, imp in ranked}, sorted(leaky)
+
+
+def _rank_candidate_features(df, treatment_col, treatment_binarized):
     candidate_cols = _numeric_candidate_columns(df, exclude={treatment_col})
     leaky = _leakage_correlated_columns(df, treatment_col, treatment_binarized, candidate_cols)
     candidate_cols = [c for c in candidate_cols if c not in leaky]
@@ -195,8 +219,48 @@ def select_top_features(df, treatment_col, treatment_binarized, top_n=30):
     ranker.fit(X, y)
 
     ranked = sorted(zip(candidate_cols, ranker.feature_importances_), key=lambda p: p[1], reverse=True)
-    top = ranked[:top_n]
-    return [name for name, _ in top], {name: json_safe_float(imp) for name, imp in ranked}, sorted(leaky)
+    return ranked, leaky
+
+
+def select_or_merge_features(df, treatment_col, treatment_binarized, previous_features=None, top_n=30):
+    """
+    Like select_top_features, but when `previous_features` (an existing
+    model's schema) is given, keeps whichever of those are still present and
+    usable in `df`, and only backfills the remaining slots with this
+    dataset's own top-ranked features -- rather than discarding a proven
+    feature set every time a new file comes in. Falls back to a plain
+    top-`top_n` selection when no previous schema is given, or when none of
+    it carries over (e.g. a structurally unrelated dataset).
+
+    Returns (final_features, importances_dict_for_ranked, leaky_excluded,
+    breakdown) where breakdown = {"kept_from_previous": [...],
+    "added_new": [...], "dropped_from_previous": [...]}.
+    """
+    ranked, leaky = _rank_candidate_features(df, treatment_col, treatment_binarized)
+    ranked_names = [name for name, _ in ranked]
+    importance_by_name = dict(ranked)
+
+    if not previous_features:
+        top = ranked_names[:top_n]
+        return top, {name: json_safe_float(imp) for name, imp in ranked}, sorted(leaky), {
+            "kept_from_previous": [], "added_new": top, "dropped_from_previous": [],
+        }
+
+    usable_previous = [f for f in previous_features if f in importance_by_name]
+
+    # Keep as many previous features as fit, prioritizing the ones that are
+    # still most important in this dataset (not just insertion order).
+    usable_previous.sort(key=lambda f: importance_by_name[f], reverse=True)
+    kept = usable_previous[:top_n]
+    dropped = [f for f in previous_features if f not in kept]
+
+    remaining_slots = top_n - len(kept)
+    added = [name for name in ranked_names if name not in kept][:max(remaining_slots, 0)]
+
+    final_features = kept + added
+    return final_features, {name: json_safe_float(imp) for name, imp in ranked}, sorted(leaky), {
+        "kept_from_previous": kept, "added_new": added, "dropped_from_previous": dropped,
+    }
 
 
 def train_psm_model(df, treatment_binarized, feature_cols):
