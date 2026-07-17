@@ -33,6 +33,9 @@ _SCALING_REQUIRED_MODELS = {"MLPClassifier"}
 # noise, not a ranking -- mirrors the old /train endpoint's MIN_TRAINING_ROWS
 # guard.
 MIN_DYNAMIC_ADAPT_ROWS = 10
+# Feature-set size for the fully data-driven fallback (dataset shares no core
+# baseline columns at all) -- same top-N the core set itself was built with.
+FALLBACK_TOP_N = 30
 
 
 def json_safe_float(value):
@@ -195,26 +198,27 @@ def predict_dynamic(df, core_features, all_features, baseline_model, baseline_sc
         is subtracted from flex candidates too -- callers with a separate
         outcome column (estimate_att_dynamic) must pass it here, or it'll get
         picked as a "predictor" of treatment, which is nonsense.
-      - Missing a core feature -> raises ValueError.
+      - Core features partially or entirely missing -> fully data-driven
+        fallback: every numeric column (minus exclusions) is ranked against
+        `treatment_col` and the top FALLBACK_TOP_N form the feature set.
+        Same throwaway-model semantics; the result's `core_coverage` tells
+        the caller how much of the trusted core actually backed this score.
 
     The baseline branch does NOT require `treatment_col` -- real-world
     /predict_ps calls are usually scoring someone whose treatment status is
     exactly what's unknown, and the fixed baseline model needs no labels to
     run. This is a deliberate relaxation of predictor_psm.ipynb (which
-    requires the column unconditionally); the dynamic-adaptation branch below
-    still requires it, since it can't be avoided there.
+    requires the column unconditionally); the dynamic-adaptation branches
+    still require it, since it can't be avoided there.
 
-    Returns a dict: {ps, ps_logit, used_baseline, final_features, model, X}.
-    `model`/`X` (a DataFrame indexed like `df`) let callers reuse the exact
-    fitted model/matrix for further work (e.g. matched ATT) instead of
-    re-deriving them.
+    Returns a dict: {ps, ps_logit, used_baseline, final_features,
+    core_coverage, model, X}. `model`/`X` (a DataFrame indexed like `df`)
+    let callers reuse the exact fitted model/matrix for further work (e.g.
+    matched ATT) instead of re-deriving them.
     """
     cols_present = set(df.columns)
-    missing_core = [f for f in core_features if f not in cols_present]
-    if missing_core:
-        raise ValueError(
-            f"missing core baseline features: {missing_core[:5]}{'...' if len(missing_core) > 5 else ''}"
-        )
+    core_present = [f for f in core_features if f in cols_present]
+    core_coverage = len(core_present) / len(core_features) if core_features else 0.0
 
     used_baseline = all(f in cols_present for f in all_features)
 
@@ -238,9 +242,20 @@ def predict_dynamic(df, core_features, all_features, baseline_model, baseline_sc
                 f"{len(all_features)} baseline features instead, or provide a larger dataset."
             )
         treatment_binarized = df[treatment_col].astype(int)
-        flex = select_flex_features(df, core_features, treatment_binarized,
-                                     exclude={treatment_col} | set(exclude_cols), n_flex=n_flex)
-        final_features = core_features + flex
+        if core_coverage == 1.0:
+            flex = select_flex_features(df, core_features, treatment_binarized,
+                                         exclude={treatment_col} | set(exclude_cols), n_flex=n_flex)
+            final_features = core_features + flex
+        else:
+            # Fully data-driven fallback: nothing (or not everything) from
+            # the trusted core is present, so rank ALL numeric columns on
+            # their own merit -- surviving core columns compete like any
+            # other candidate and rank in if they earn it.
+            final_features = select_flex_features(df, [], treatment_binarized,
+                                                   exclude={treatment_col} | set(exclude_cols),
+                                                   n_flex=FALLBACK_TOP_N)
+            if not final_features:
+                raise ValueError("no usable numeric feature columns found in this dataset")
         X = impute_dataframe(df, final_features)[final_features]
         scaler = StandardScaler()
         X_input = scaler.fit_transform(X)
@@ -253,6 +268,7 @@ def predict_dynamic(df, core_features, all_features, baseline_model, baseline_sc
         "ps_logit": logit(ps),
         "used_baseline": used_baseline,
         "final_features": final_features,
+        "core_coverage": core_coverage,
         "model": model,
         "X": X,
     }
@@ -264,14 +280,16 @@ def decision_support_table(df_with_ps, key_features=None, ps_col="ps"):
     "which beneficiaries look like priority cases" view from
     predictor_psm.ipynb's decision-support step.
     """
-    quartiles = pd.qcut(df_with_ps[ps_col], q=4, labels=["Low", "Med-Low", "Med-High", "High"], duplicates="drop")
     df = df_with_ps.copy()
-    df["ps_group"] = quartiles
 
-    key_features = [f for f in (key_features or []) if f in df.columns]
-    agg = {"Count": (ps_col, "count"), "Mean_PS": (ps_col, "mean")}
-    agg.update({f"Mean_{f}": (f, "mean") for f in key_features})
-    table = df.groupby("ps_group", observed=False).agg(**agg).reset_index()
+    # A near-perfectly separating model collapses the PS distribution into
+    # fewer than 4 distinct quantile bins (duplicates="drop" merges them),
+    # so the quartile labels can't be assumed -- label whatever bins survive.
+    try:
+        codes = pd.qcut(df[ps_col], q=4, labels=False, duplicates="drop")
+        n_bins = int(codes.max()) + 1 if len(codes) else 0
+    except ValueError:
+        n_bins = 0
 
     interpretation = {
         "Low": "Very low likelihood - may need targeted outreach",
@@ -279,8 +297,27 @@ def decision_support_table(df_with_ps, key_features=None, ps_col="ps"):
         "Med-High": "Above average - likely beneficiaries",
         "High": "High likelihood - priority for intervention",
     }
+    if n_bins == 4:
+        labels = ["Low", "Med-Low", "Med-High", "High"]
+    elif n_bins >= 2:
+        labels = [f"Group {i + 1} (of {n_bins})" for i in range(n_bins)]
+        interpretation = {label: "PS distribution too concentrated for quartile stratification - groups are coarser quantiles" for label in labels}
+    else:
+        labels = ["All"]
+        codes = pd.Series(0, index=df.index)
+        interpretation = {"All": "PS distribution has no spread - stratification not meaningful"}
+
+    df["ps_group"] = [labels[int(c)] for c in codes]
+
+    key_features = [f for f in (key_features or []) if f in df.columns]
+    agg = {"Count": (ps_col, "count"), "Mean_PS": (ps_col, "mean")}
+    agg.update({f"Mean_{f}": (f, "mean") for f in key_features})
+    table = df.groupby("ps_group", observed=False).agg(**agg).reset_index()
+
     table["Interpretation"] = table["ps_group"].map(interpretation)
-    return table
+    # Present groups in PS order, not alphabetical.
+    order = {label: i for i, label in enumerate(labels)}
+    return table.sort_values("ps_group", key=lambda s: s.map(order)).reset_index(drop=True)
 
 
 def logit(p):
@@ -380,4 +417,54 @@ def estimate_att_dynamic(df, core_features, all_features, baseline_model, baseli
 
     att_result["used_baseline"] = result["used_baseline"]
     att_result["final_features"] = result["final_features"]
+    att_result["core_coverage"] = result["core_coverage"]
+    return att_result, None
+
+
+def predict_with_index_model(df, mapping, taxonomy, index_stats, index_model, index_scaler):
+    """Tier-2 scoring: folds `df` into the 6 composite indices via a
+    registered `mapping` (see psm_indices.compute_indices) and scores with
+    the frozen index-space baseline model. No fitting, no labels needed --
+    same result-dict shape as predict_dynamic so _matched_att and the
+    endpoints reuse it unchanged, plus `imputed_indices` (indices with no
+    mapped items, filled with bfar's median -- consumers should see how much
+    of the score rests on real columns)."""
+    from psm_indices import compute_indices
+
+    X, imputed = compute_indices(df, mapping, taxonomy, index_stats)
+    X_input = index_scaler.transform(X) if model_needs_scaling(index_model) else X
+    ps = index_model.predict_proba(X_input)[:, 1]
+    return {
+        "ps": ps,
+        "ps_logit": logit(ps),
+        "used_baseline": True,
+        "final_features": list(X.columns),
+        "core_coverage": None,
+        "imputed_indices": imputed,
+        "model": index_model,
+        "X": X,
+    }
+
+
+def estimate_att_with_index_model(df, mapping, taxonomy, index_stats, index_model, index_scaler,
+                                    treatment_col="treatment", outcome_col="outcome",
+                                    caliper_ratio=0.2, n_bootstrap=500, seed=42):
+    """Tier-2 counterpart to estimate_att_dynamic: index-space propensity
+    scores from the frozen index model, then the same matched-ATT
+    computation."""
+    if treatment_col not in df.columns or outcome_col not in df.columns:
+        return None, f"dataset must include '{treatment_col}' and '{outcome_col}' columns"
+
+    result = predict_with_index_model(df, mapping, taxonomy, index_stats, index_model, index_scaler)
+
+    treatments = df[treatment_col].astype(int).to_numpy()
+    outcomes = pd.to_numeric(df[outcome_col], errors="coerce").to_numpy(dtype=float)
+
+    att_result, err = _matched_att(result["ps_logit"], treatments, outcomes, caliper_ratio, n_bootstrap, seed)
+    if err:
+        return None, err
+
+    att_result["used_baseline"] = True
+    att_result["final_features"] = result["final_features"]
+    att_result["imputed_indices"] = result["imputed_indices"]
     return att_result, None

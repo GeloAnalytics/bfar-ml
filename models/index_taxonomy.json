@@ -1,0 +1,628 @@
+{
+  "indices": {
+    "transport_assets": {
+      "items": {
+        "D1.1:A_BIKE": {
+          "weight": 0.1140215450310593,
+          "mean": 0.20911127707244212,
+          "std": 0.40682595304201924,
+          "keywords": [
+            "bike",
+            "bicycle"
+          ],
+          "quantity": false
+        },
+        "D1.1-A_QTY": {
+          "weight": 0.18689358311760085,
+          "mean": 0.20985810306198655,
+          "std": 0.40918990390597526,
+          "keywords": [
+            "bike",
+            "bicycle"
+          ],
+          "quantity": true
+        },
+        "D1.2:A_MOTORC": {
+          "weight": 0.1224951394244761,
+          "mean": 0.30694548170276326,
+          "std": 0.46139889895973835,
+          "keywords": [
+            "motorcycle",
+            "motorbike",
+            "motor"
+          ],
+          "quantity": false
+        },
+        "D1.2-A_QTY": {
+          "weight": 0.05380437467384253,
+          "mean": 0.30694548170276326,
+          "std": 0.46139889895973835,
+          "keywords": [
+            "motorcycle",
+            "motorbike",
+            "motor"
+          ],
+          "quantity": true
+        },
+        "D1.3:A_TRICYCLE": {
+          "weight": 0.11702674286252326,
+          "mean": 0.07318894697535475,
+          "std": 0.26054370424352635,
+          "keywords": [
+            "tricycle",
+            "trike"
+          ],
+          "quantity": false
+        },
+        "D1.3-A_QTY": {
+          "weight": 0.09394757036010204,
+          "mean": 0.07318894697535475,
+          "std": 0.26054370424352635,
+          "keywords": [
+            "tricycle",
+            "trike"
+          ],
+          "quantity": true
+        },
+        "D1.4:A_CAR": {
+          "weight": 0.025058071241027078,
+          "mean": 0.009708737864077669,
+          "std": 0.09809008095566356,
+          "keywords": [
+            "car",
+            "automobile",
+            "sedan"
+          ],
+          "quantity": false
+        },
+        "D1.4-A_QTY": {
+          "weight": 0.014303271541069617,
+          "mean": 0.009708737864077669,
+          "std": 0.09809008095566356,
+          "keywords": [
+            "car",
+            "automobile",
+            "sedan"
+          ],
+          "quantity": true
+        },
+        "D1.5:A_JEEP": {
+          "weight": 0.0261901981271217,
+          "mean": 0.00597460791635549,
+          "std": 0.0770931295597297,
+          "keywords": [
+            "jeep",
+            "jeepney"
+          ],
+          "quantity": false
+        },
+        "D1.5-A_QTY": {
+          "weight": 0.014726870244823855,
+          "mean": 0.006721433905899925,
+          "std": 0.0817388889102012,
+          "keywords": [
+            "jeep",
+            "jeepney"
+          ],
+          "quantity": true
+        },
+        "D1.6:A_TRUCK": {
+          "weight": 0.0055294289533906835,
+          "mean": 0.004480955937266617,
+          "std": 0.06681475106533415,
+          "keywords": [
+            "truck",
+            "lorry"
+          ],
+          "quantity": false
+        },
+        "D1.6-A_QTY": {
+          "weight": 0.006023204488577307,
+          "mean": 0.005227781926811053,
+          "std": 0.07214110450034286,
+          "keywords": [
+            "truck",
+            "lorry"
+          ],
+          "quantity": true
+        },
+        "D1.7:A_OTHERS": {
+          "weight": 0.024019322820359356,
+          "mean": 0.020164301717699777,
+          "std": 0.1406146124975961,
+          "keywords": [
+            "othervehicle",
+            "othertransport"
+          ],
+          "quantity": false
+        },
+        "D1.7-A_QTY": {
+          "weight": 0.1959606771140264,
+          "mean": 0.019417475728155338,
+          "std": 0.1380386463484086,
+          "keywords": [
+            "othervehicle",
+            "othertransport"
+          ],
+          "quantity": true
+        }
+      }
+    },
+    "household_durables": {
+      "items": {
+        "D2.1:A_TV": {
+          "weight": 0.05123489861712473,
+          "mean": 0.5802837938760269,
+          "std": 0.49369681103331,
+          "keywords": [
+            "tv",
+            "television"
+          ],
+          "quantity": false
+        },
+        "D2.1-A_QTY": {
+          "weight": 0.18243946293332405,
+          "mean": 0.5847647498132935,
+          "std": 0.4944604954258376,
+          "keywords": [
+            "tv",
+            "television"
+          ],
+          "quantity": true
+        },
+        "D2.2:A_DVD": {
+          "weight": 0.049186845296155364,
+          "mean": 0.128454070201643,
+          "std": 0.33471972516351745,
+          "keywords": [
+            "dvd"
+          ],
+          "quantity": false
+        },
+        "D2.2-A_QTY": {
+          "weight": 0.06440342640207494,
+          "mean": 0.12920089619118746,
+          "std": 0.33776749346325774,
+          "keywords": [
+            "dvd"
+          ],
+          "quantity": true
+        },
+        "D2.3:A_WASH-M": {
+          "weight": 0.0471269959443048,
+          "mean": 0.29424943988050783,
+          "std": 0.45587488833774403,
+          "keywords": [
+            "washingmachine",
+            "washer"
+          ],
+          "quantity": false
+        },
+        "D2.3-A_QTY": {
+          "weight": 0.0347015760617755,
+          "mean": 0.2949962658700523,
+          "std": 0.4578467793696598,
+          "keywords": [
+            "washingmachine",
+            "washer"
+          ],
+          "quantity": true
+        },
+        "D2.4:A_AC": {
+          "weight": 0.022767050130108404,
+          "mean": 0.05227781926811053,
+          "std": 0.22266988551602387,
+          "keywords": [
+            "ac",
+            "aircon",
+            "airconditioner",
+            "airconditioning"
+          ],
+          "quantity": false
+        },
+        "D2.4-A_QTY": {
+          "weight": 0.06504338970864068,
+          "mean": 0.05825242718446602,
+          "std": 0.23430766679771295,
+          "keywords": [
+            "ac",
+            "aircon",
+            "airconditioner",
+            "airconditioning"
+          ],
+          "quantity": true
+        },
+        "D2.5:A_E-FAN": {
+          "weight": 0.05000030849142035,
+          "mean": 0.7064973861090366,
+          "std": 0.45553683301553144,
+          "keywords": [
+            "fan",
+            "electricfan"
+          ],
+          "quantity": false
+        },
+        "D2.5-A_QTY": {
+          "weight": 0.11259799675986408,
+          "mean": 0.7102315160567588,
+          "std": 0.4619852431575958,
+          "keywords": [
+            "fan",
+            "electricfan"
+          ],
+          "quantity": true
+        },
+        "D2.6:A_FRIDGE": {
+          "weight": 0.0052949712557656976,
+          "mean": 0.2337565347274085,
+          "std": 0.42337723660710797,
+          "keywords": [
+            "fridge",
+            "refrigerator",
+            "ref"
+          ],
+          "quantity": false
+        },
+        "D2.6-A_QTY": {
+          "weight": 0.001986531212661676,
+          "mean": 0.2337565347274085,
+          "std": 0.42337723660710797,
+          "keywords": [
+            "fridge",
+            "refrigerator",
+            "ref"
+          ],
+          "quantity": true
+        },
+        "D2.7:A_STOVE": {
+          "weight": 0.029858351071301973,
+          "mean": 0.25392083644510827,
+          "std": 0.43541547226675914,
+          "keywords": [
+            "stove",
+            "cooker",
+            "gasrange"
+          ],
+          "quantity": false
+        },
+        "D2.7-A_QTY": {
+          "weight": 0.04055598364147136,
+          "mean": 0.25392083644510827,
+          "std": 0.43541547226675914,
+          "keywords": [
+            "stove",
+            "cooker",
+            "gasrange"
+          ],
+          "quantity": true
+        },
+        "D2.8:A_E-HEATER": {
+          "weight": 0.04366107939945352,
+          "mean": 0.08065720687079911,
+          "std": 0.27240969439040297,
+          "keywords": [
+            "heater",
+            "waterheater"
+          ],
+          "quantity": false
+        },
+        "D2.8-A_QTY": {
+          "weight": 0.06498070258627366,
+          "mean": 0.08513816280806571,
+          "std": 0.27919145677569096,
+          "keywords": [
+            "heater",
+            "waterheater"
+          ],
+          "quantity": true
+        },
+        "D2.9:A_FURNITURE": {
+          "weight": 0.031674908210406236,
+          "mean": 0.12546676624346528,
+          "std": 0.33137118678502175,
+          "keywords": [
+            "furniture"
+          ],
+          "quantity": false
+        },
+        "D2.9-A_QTY": {
+          "weight": 0.039026557186232644,
+          "mean": 0.12546676624346528,
+          "std": 0.33137118678502175,
+          "keywords": [
+            "furniture"
+          ],
+          "quantity": true
+        },
+        "D2.10:A_OTHERS": {
+          "weight": 0.026901584877116417,
+          "mean": 0.028379387602688575,
+          "std": 0.16611624342960657,
+          "keywords": [
+            "otherappliance",
+            "otherdurable"
+          ],
+          "quantity": false
+        },
+        "D2.10-A_QTY": {
+          "weight": 0.036557380214523955,
+          "mean": 0.03211351755041075,
+          "std": 0.1763674287228206,
+          "keywords": [
+            "otherappliance",
+            "otherdurable"
+          ],
+          "quantity": true
+        }
+      }
+    },
+    "connectivity": {
+      "items": {
+        "D3.1:A_CP": {
+          "weight": 0.35847065513159837,
+          "mean": 0.684839432412248,
+          "std": 0.46475337053591204,
+          "keywords": [
+            "cp",
+            "cellphone",
+            "mobilephone",
+            "smartphone",
+            "phone",
+            "mobile"
+          ],
+          "quantity": false
+        },
+        "D3.1-A_QTY": {
+          "weight": 0.445411962803559,
+          "mean": 0.684839432412248,
+          "std": 0.46475337053591204,
+          "keywords": [
+            "cp",
+            "cellphone",
+            "mobilephone",
+            "smartphone",
+            "phone",
+            "mobile"
+          ],
+          "quantity": true
+        },
+        "D3.2:A_LANDLINE": {
+          "weight": 0.005615933788166262,
+          "mean": 0.008215085884988798,
+          "std": 0.09029777203634262,
+          "keywords": [
+            "landline",
+            "telephone"
+          ],
+          "quantity": false
+        },
+        "D3.2-A_QTY": {
+          "weight": 0.0018447875715470478,
+          "mean": 0.008961911874533234,
+          "std": 0.10189701803846489,
+          "keywords": [
+            "landline",
+            "telephone"
+          ],
+          "quantity": true
+        },
+        "D3.3:A_COMPUTER": {
+          "weight": 0.0,
+          "mean": 0.030619865571321882,
+          "std": 0.17234985777921039,
+          "keywords": [
+            "computer",
+            "laptop",
+            "desktop",
+            "pc"
+          ],
+          "quantity": false
+        },
+        "D3.3-A_QTY": {
+          "weight": 0.013879321417146219,
+          "mean": 0.030619865571321882,
+          "std": 0.17663307104680556,
+          "keywords": [
+            "computer",
+            "laptop",
+            "desktop",
+            "pc"
+          ],
+          "quantity": true
+        },
+        "D3.4:A_OTHERS": {
+          "weight": 0.08311944484223659,
+          "mean": 0.0268857356235997,
+          "std": 0.16180990876689158,
+          "keywords": [
+            "othergadget",
+            "otherdevice"
+          ],
+          "quantity": false
+        },
+        "D3.4-A_QTY": {
+          "weight": 0.09165789444574644,
+          "mean": 0.028379387602688575,
+          "std": 0.17055607477330179,
+          "keywords": [
+            "othergadget",
+            "otherdevice"
+          ],
+          "quantity": true
+        }
+      }
+    },
+    "utilities_access": {
+      "items": {
+        "E1:A_DRINK-H2O": {
+          "weight": 0.3204967257357344,
+          "mean": 2.7296489917849143,
+          "std": 1.08189784220886,
+          "keywords": [
+            "drinkingwater",
+            "drinkwater",
+            "potablewater"
+          ],
+          "quantity": false
+        },
+        "E2:A_DOMESTIC-H2O": {
+          "weight": 0.20278086635296572,
+          "mean": 2.5840179238237493,
+          "std": 1.2680086855318957,
+          "keywords": [
+            "domesticwater",
+            "watersupply",
+            "watersource"
+          ],
+          "quantity": false
+        },
+        "E3:A_POWER-SUP": {
+          "weight": 0.2338449303280127,
+          "mean": 2.4167289021657954,
+          "std": 0.945236374211578,
+          "keywords": [
+            "electricity",
+            "power",
+            "powersupply",
+            "powersource"
+          ],
+          "quantity": false
+        },
+        "E4:A_COOK-FUEL": {
+          "weight": 0.180265173669627,
+          "mean": 2.3487677371172517,
+          "std": 0.7952237215958926,
+          "keywords": [
+            "cookingfuel",
+            "cookfuel",
+            "fuel",
+            "lpg"
+          ],
+          "quantity": false
+        },
+        "E5:A_NET-SUBS": {
+          "weight": 0.06261230391366018,
+          "mean": 0.07841672890216579,
+          "std": 0.26892667615715105,
+          "keywords": [
+            "internet",
+            "wifi",
+            "broadband",
+            "netsubscription"
+          ],
+          "quantity": false
+        }
+      }
+    },
+    "housing": {
+      "items": {
+        "F1:A_HOUSE-OWN": {
+          "weight": 0.10552790087509695,
+          "mean": 2.4996265870052277,
+          "std": 0.8020665634890859,
+          "keywords": [
+            "houseownership",
+            "homeownership",
+            "ownhouse",
+            "houseown",
+            "housingtenure"
+          ],
+          "quantity": false
+        },
+        "F2:A_HOUSE-ACQ": {
+          "weight": 0.16241504773159096,
+          "mean": 2.3588498879761017,
+          "std": 1.383579397720393,
+          "keywords": [
+            "houseacquisition",
+            "houseacquired",
+            "howacquired"
+          ],
+          "quantity": false
+        },
+        "F3:A_HOUSE-BUILT": {
+          "weight": 0.3111248253858554,
+          "mean": 1.9824495892457057,
+          "std": 0.9008539236409907,
+          "keywords": [
+            "housebuilt",
+            "housematerial",
+            "houseconstruction",
+            "construction"
+          ],
+          "quantity": false
+        },
+        "F4:A_OTHER-RP": {
+          "weight": 0.42093222600745667,
+          "mean": 2.3831217326362957,
+          "std": 1.425912906425109,
+          "keywords": [
+            "otherproperty",
+            "realproperty",
+            "otherrealproperty"
+          ],
+          "quantity": false
+        }
+      }
+    },
+    "social_protection": {
+      "items": {
+        "G1:A_SSS": {
+          "weight": 0.02871753895795847,
+          "mean": 0.2128454070201643,
+          "std": 0.40947217017268606,
+          "keywords": [
+            "sss",
+            "socialsecurity"
+          ],
+          "quantity": false
+        },
+        "G2:A_GSIS": {
+          "weight": 0.061412825469780684,
+          "mean": 0.03211351755041075,
+          "std": 0.1763674287228206,
+          "keywords": [
+            "gsis"
+          ],
+          "quantity": false
+        },
+        "G3:A_PhilHealth": {
+          "weight": 0.5847591393119125,
+          "mean": 0.4817027632561613,
+          "std": 0.4998517849828139,
+          "keywords": [
+            "philhealth"
+          ],
+          "quantity": false
+        },
+        "G4:A_PN-IN": {
+          "weight": 0.15664513659736903,
+          "mean": 0.05750560119492158,
+          "std": 0.23289313918836196,
+          "keywords": [
+            "pension"
+          ],
+          "quantity": false
+        },
+        "G5:A_LIFE-IN": {
+          "weight": 0.056185194391825635,
+          "mean": 0.04854368932038835,
+          "std": 0.2149923699313087,
+          "keywords": [
+            "lifeinsurance"
+          ],
+          "quantity": false
+        },
+        "G6:A_HEALTH-IN": {
+          "weight": 0.11228016527115361,
+          "mean": 0.041075429424943986,
+          "std": 0.19853885430283782,
+          "keywords": [
+            "healthinsurance"
+          ],
+          "quantity": false
+        }
+      }
+    }
+  }
+}
