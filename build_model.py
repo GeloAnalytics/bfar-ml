@@ -1,15 +1,14 @@
-"""Trains the frozen bfar.csv baseline artifacts served by app.py and app_dynamic.py.
+"""Trains the frozen bfar.csv baseline artifacts served by app.py.
 
 Mirrors the model-selection methodology from updated_psm.ipynb: 5-fold CV across
 four candidate classifiers (Logistic Regression, Random Forest, Gradient Boosting,
 Neural Network), picks the lowest-MSE model, fits it on the full dataset, and
 splits its feature importances into a fixed 30-feature "core" set (always required
-by the dynamic service's per-request adaptation, see psm_core.predict_dynamic) and
-a 27-feature "remaining" set (informational only -- new datasets may substitute
-their own equally-ranked features in these slots instead).
+by per-request dynamic adaptation, see psm_core.predict_dynamic) and a 27-feature
+"remaining" set (informational only -- new datasets may substitute their own
+equally-ranked features in these slots instead).
 
-Run this whenever bfar.csv changes; neither app.py nor app_dynamic.py ever
-retrains these artifacts themselves.
+Run this whenever bfar.csv changes; app.py never retrains these artifacts itself.
 """
 import json
 import os

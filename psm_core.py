@@ -1,15 +1,13 @@
-"""Shared propensity-score-matching (PSM) logic used by both Flask services:
-app.py (static, bfar.csv-only) and app_dynamic.py (arbitrary uploaded datasets).
+"""Propensity-score-matching (PSM) logic shared by app.py's endpoints.
 
-Both services are grounded in the same frozen bfar.csv baseline (models/best_model.pkl,
+app.py is grounded in a frozen bfar.csv baseline (models/best_model.pkl,
 models/scaler.pkl, models/all_features.json, models/core_features.json,
-models/remaining_features.json -- produced by build_model.py). Neither service ever
-retrains or overwrites that baseline: app.py always scores against it directly, and
-app_dynamic.py's dynamic feature adaptation (see predict_dynamic) fits a throwaway
-model per request, scoped to that request only.
+models/remaining_features.json -- produced by build_model.py) and never retrains or
+overwrites it: requests covering all baseline features score against it directly,
+and dynamic feature adaptation for partial requests (see predict_dynamic) fits a
+throwaway model per request, scoped to that request only.
 """
 import re
-from difflib import SequenceMatcher
 
 import numpy as np
 import pandas as pd
@@ -41,21 +39,6 @@ def json_safe_float(value):
     """Converts NaN/inf to None so responses stay valid JSON for strict clients."""
     value = float(value)
     return value if np.isfinite(value) else None
-
-
-def as_bool(value, default=True):
-    if value is None:
-        return default
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, str):
-        return value.strip().lower() not in {"false", "0", "no", "off"}
-    return bool(value)
-
-
-def _normalize_key(s):
-    s = str(s).lower()
-    return re.sub(r"[^a-z0-9]+", "", s)
 
 
 def _is_id_like(series, name):
@@ -305,113 +288,9 @@ def logit(p):
     return np.log(p / (1 - p))
 
 
-def _infer_feature_map(feature_cols, incoming_feature_keys):
-    incoming_norm = {_normalize_key(k): k for k in incoming_feature_keys}
-    norm_values = list(incoming_norm.keys())
-
-    mapping = {}
-    for mf in feature_cols:
-        mf_norm = _normalize_key(mf)
-        if mf_norm in incoming_norm:
-            mapping[mf] = incoming_norm[mf_norm]
-            continue
-        best, best_score = None, 0.0
-        for in_norm in norm_values:
-            score = SequenceMatcher(None, mf_norm, in_norm).ratio()
-            if score > best_score:
-                best_score, best = score, incoming_norm[in_norm]
-        if best is not None and best_score >= 0.72:
-            mapping[mf] = best
-    return mapping
-
-
-def validate_records(records, feature_cols, require_treatment=False, require_outcome=False,
-                      treatmentKey="treatment", outcomeKey="outcome"):
-    if not isinstance(records, list) or len(records) == 0:
-        return "records must be a non-empty array"
-
-    required_feature_set = set(feature_cols or [])
-    for i, r in enumerate(records):
-        if not isinstance(r, dict):
-            return f"record at index {i} must be an object"
-
-        if require_treatment and treatmentKey not in r:
-            return f"record at index {i} missing required field: {treatmentKey}"
-        if require_outcome and outcomeKey not in r:
-            return f"record at index {i} missing required field: {outcomeKey}"
-
-        if "features" in r and isinstance(r["features"], dict):
-            incoming_keys = set(r["features"].keys())
-        else:
-            incoming_keys = set(r.keys())
-
-        missing = []
-        for mf in required_feature_set:
-            if "features" in r and isinstance(r["features"], dict):
-                if mf not in incoming_keys:
-                    missing.append(mf)
-            else:
-                if mf not in r:
-                    missing.append(mf)
-
-        if missing and not ("features" in r and isinstance(r["features"], dict)):
-            return f"record at index {i} missing features: {missing[:5]}{'...' if len(missing) > 5 else ''}"
-
-    return None
-
-
-def build_X_from_records(records, feature_cols, featureMap=None, auto_infer=True):
-    first = records[0]
-    if isinstance(first, dict) and "features" in first and isinstance(first["features"], dict):
-        incoming_feature_keys = set(first["features"].keys())
-        nested_features = True
-    else:
-        incoming_feature_keys = set(first.keys())
-        nested_features = False
-
-    fmap = featureMap or {}
-    if (not fmap) and auto_infer:
-        fmap = _infer_feature_map(feature_cols, incoming_feature_keys)
-
-    missing_model_features = [mf for mf in feature_cols if mf not in fmap]
-    if missing_model_features:
-        if nested_features:
-            return None, f"could not map model features missing: {missing_model_features[:10]}{'...' if len(missing_model_features) > 10 else ''}"
-        fmap = {mf: mf for mf in feature_cols}
-
-    X = []
-    for r in records:
-        row = []
-        features_obj = r.get("features", {}) if isinstance(r, dict) else {}
-        for mf in feature_cols:
-            incoming_key = fmap[mf]
-            if nested_features:
-                if incoming_key not in features_obj:
-                    return None, f"missing mapped incoming feature '{incoming_key}' for model feature '{mf}'"
-                row.append(float(features_obj[incoming_key]))
-            else:
-                row.append(float(r[incoming_key]))
-        X.append(row)
-
-    return np.asarray(X, dtype=float), None
-
-
-def predict_ps(model, feature_cols, records, featureMap=None, auto_infer=True, scaler=None):
-    err = validate_records(records, feature_cols)
-    if err:
-        return None, err
-    X, x_err = build_X_from_records(records, feature_cols, featureMap, auto_infer)
-    if x_err:
-        return None, x_err
-    X_input = scaler.transform(X) if scaler is not None else X
-    ps_final = model.predict_proba(X_input)[:, 1]
-    return ps_final.tolist(), None
-
-
 def _matched_att(ps_logit_final, treatments, outcomes, caliper_ratio=0.2, n_bootstrap=500, seed=42):
     """Nearest-neighbor PS matching (within a logit-scale caliper) + paired
-    t-test + bootstrap CI for the ATT. Shared by both the static/records path
-    (estimate_att) and the dynamic per-request path (estimate_att_dynamic) --
+    t-test + bootstrap CI for the ATT. Used by estimate_att_dynamic --
     everything upstream of this just needs to produce a ps_logit array plus
     aligned treatment/outcome arrays."""
     caliper = caliper_ratio * np.std(ps_logit_final)
@@ -477,35 +356,12 @@ def _matched_att(ps_logit_final, treatments, outcomes, caliper_ratio=0.2, n_boot
     }, None
 
 
-def estimate_att(model, feature_cols, records, featureMap=None, auto_infer=True,
-                  caliper_ratio=0.2, n_bootstrap=500, seed=42,
-                  treatmentKey="treatment", outcomeKey="outcome", scaler=None):
-    err = validate_records(records, feature_cols, require_treatment=True, require_outcome=True,
-                            treatmentKey=treatmentKey, outcomeKey=outcomeKey)
-    if err:
-        return None, err
-
-    treatments = np.asarray([int(r[treatmentKey]) for r in records], dtype=int)
-    outcomes = np.asarray([float(r[outcomeKey]) for r in records], dtype=float)
-
-    X, x_err = build_X_from_records(records, feature_cols, featureMap, auto_infer)
-    if x_err:
-        return None, x_err
-
-    X_input = scaler.transform(X) if scaler is not None else X
-    ps_final = model.predict_proba(X_input)[:, 1]
-    ps_logit_final = logit(ps_final)
-
-    return _matched_att(ps_logit_final, treatments, outcomes, caliper_ratio, n_bootstrap, seed)
-
-
 def estimate_att_dynamic(df, core_features, all_features, baseline_model, baseline_scaler,
                           treatment_col="treatment", outcome_col="outcome", n_flex=27,
                           caliper_ratio=0.2, n_bootstrap=500, seed=42):
-    """Dynamic-service counterpart to estimate_att: takes a whole DataFrame
-    (already has treatment+outcome columns, unlike a real predict_ps caller),
+    """Takes a whole DataFrame (already has treatment+outcome columns),
     resolves baseline-vs-ephemeral-adapt via predict_dynamic, then runs the
-    same matched-ATT computation."""
+    matched-ATT computation (_matched_att)."""
     if treatment_col not in df.columns or outcome_col not in df.columns:
         return None, f"dataset must include '{treatment_col}' and '{outcome_col}' columns"
 
