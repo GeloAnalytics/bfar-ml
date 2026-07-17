@@ -3,7 +3,7 @@ __pycache__/
 
 models/*.joblib
 models/*.pickle
-mappings/
+models/dynamic/
 
 .venv/
 .claude/
