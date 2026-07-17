@@ -13,6 +13,65 @@ baseline:
 
 If this repo is dropped into another project as a subfolder (commonly named `ml/`), prefix the commands below with that folder (e.g. `pip install -r ml/requirements.txt`, `python ml/app.py`). All paths resolve relative to each file's own location, so it works the same whether this is the repo root or a nested subfolder -- `bfar.csv` just needs to stay next to `build_model.py`.
 
+## Integration guide (backend & frontend)
+
+**Architecture.** Both services are plain, unauthenticated Flask HTTP APIs -- there's
+no API key, session, or user concept anywhere in this repo. Treat this as an internal
+ML layer that your **backend** calls server-to-server, not something a frontend talks
+to directly in production. `app_dynamic.py` binds `0.0.0.0` (LAN-reachable) purely so
+a backend running on a different machine/container can reach it; it is not meant to be
+exposed to the public internet as-is.
+
+```
+frontend  -->  your backend  -->  app.py (127.0.0.1:8000)      known-good baseline
+                              \->  app_dynamic.py (host:8001)   arbitrary uploads
+```
+
+**Base URLs.** Nothing in this repo reads these -- they're just the conventional env
+var names to set in whatever backend consumes this service:
+
+| Backend env var | Points at | Local default |
+|---|---|---|
+| `ML_STATIC_URL` | `app.py` | `http://127.0.0.1:8000` |
+| `ML_DYNAMIC_URL` | `app_dynamic.py` | `http://<host>:8001` |
+
+**Error contract.** Every endpoint on both services returns JSON with the same shape:
+- `200` -- success, body is the endpoint-specific payload documented below.
+- `400` -- bad/incomplete input (missing features, unparsable CSV, no treatment column found, dataset too small, ...): `{"error": "<message>"}`. The message is written to be shown to an end user or logged as a validation failure -- it's never a stack trace.
+- `500` -- the service itself failed to load its baseline artifacts at startup: `{"error": "ML artifacts not loaded: <reason>"}`. This is an ops problem (bad `ML_MODEL_DIR`, missing `models/` files), not a user-input problem -- alert on it rather than surfacing it to end users.
+
+There is no `401`/`403`/`404`/`409` from either service currently -- if you need
+auth or rate-limiting, add it in your backend's proxy layer, not here.
+
+**CORS.** Both services call `CORS(app)` with no origin restriction, so *any* origin
+can call them directly from a browser as-is. That's fine for local development; if
+you ever let a frontend call either service directly instead of going through your
+backend, restrict this first (`CORS(app, origins=["https://your-frontend"])` in
+`app.py`/`app_dynamic.py`) -- don't rely on network placement alone.
+
+**Quick endpoint reference:**
+
+| Service | Method & path | Body | Returns |
+|---|---|---|---|
+| static (`app.py`) | `GET /health` | -- | baseline status + top-30 features |
+| static | `POST /predict_ps` | JSON `{records}`, every record needs all 57 baseline features | `{ps_final}` |
+| static | `POST /estimate_att` | JSON `{records}` with `treatment`+`outcome` per record | matched-ATT result |
+| dynamic (`app_dynamic.py`) | `GET /health` | -- | baseline status |
+| dynamic | `POST /predict_ps` | JSON `{records}`, partial feature sets OK | `{ps_final, used_baseline, final_features, ...}` |
+| dynamic | `POST /estimate_att` | JSON `{records}` with `treatment`+`outcome` per record | matched-ATT result + adaptation metadata |
+| dynamic | `POST /predict_ps_batch` | multipart CSV upload | per-row `ps` + decision-support quartile table |
+
+Full request/response bodies and examples for each are in sections 3 and 4 below.
+
+**Running in production.** `app.run(...)` is Flask's development server (it prints
+its own "do not use in production" warning on startup) -- put a real WSGI server in
+front for anything beyond local dev/integration testing, e.g.:
+```bash
+pip install waitress   # Windows-friendly; use gunicorn on Linux
+waitress-serve --host=127.0.0.1 --port=8000 app:app
+waitress-serve --host=0.0.0.0 --port=8001 app_dynamic:app
+```
+
 ## 1) Install Python dependencies
 
 ```bash
