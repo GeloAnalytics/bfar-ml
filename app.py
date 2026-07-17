@@ -3,6 +3,7 @@ from flask_cors import CORS
 from dotenv import load_dotenv
 import os
 import json
+import time
 
 import joblib
 import numpy as np
@@ -15,14 +16,11 @@ load_dotenv()
 app = Flask(__name__)
 CORS(app)
 
-# Single frozen bfar.csv baseline (models/best_model.pkl, scaler.pkl,
-# all/core/remaining_features.json -- produced by build_model.py). This
-# service never retrains or overwrites it: every request re-anchors to the
-# same baseline. Uploads/records covering all 57 baseline features are
-# scored directly against it (no fitting); partial uploads keep the 30 core
-# features fixed and dynamically fill in the rest from that request's own
-# data, fitting a throwaway model for that one request only (see
-# psm_core.predict_dynamic). Nothing is ever written back to disk.
+# ---------------------------------------------------------------------------
+# Frozen bfar.csv baseline -- produced once by build_model.py, never
+# retrained or overwritten by this service. Requests covering all 57 raw
+# baseline features score against it directly (no fitting).
+# ---------------------------------------------------------------------------
 MODEL_DIR = os.environ.get("ML_MODEL_DIR", os.path.join(os.path.dirname(__file__), "models"))
 MODEL_PATH = os.path.join(MODEL_DIR, "best_model.pkl")
 SCALER_PATH = os.path.join(MODEL_DIR, "scaler.pkl")
@@ -33,129 +31,258 @@ REMAINING_FEATURES_PATH = os.path.join(MODEL_DIR, "remaining_features.json")
 KEY_SUPPORT_FEATURES = ["D1.2:A_MOTORC", "D2.1:A_TV", "D2.6:A_FRIDGE", "E3:A_POWER-SUP", "F1:A_HOUSE-OWN"]
 
 
-def load_artifacts():
+def load_baseline_artifacts():
     for path in (MODEL_PATH, SCALER_PATH, ALL_FEATURES_PATH, CORE_FEATURES_PATH, REMAINING_FEATURES_PATH):
         if not os.path.exists(path):
             raise FileNotFoundError(f"Missing model artifact: {path}")
-
     with open(ALL_FEATURES_PATH, "r") as f:
         all_features = json.load(f)
     with open(CORE_FEATURES_PATH, "r") as f:
         core_features = json.load(f)
     with open(REMAINING_FEATURES_PATH, "r") as f:
         remaining_features = json.load(f)
-
     model = joblib.load(MODEL_PATH)
     scaler = joblib.load(SCALER_PATH)
     return all_features, core_features, remaining_features, model, scaler
 
 
 try:
-    ALL_FEATURES, CORE_FEATURES, REMAINING_FEATURES, BASELINE_MODEL, BASELINE_SCALER = load_artifacts()
+    ALL_FEATURES, CORE_FEATURES, REMAINING_FEATURES, BASELINE_MODEL, BASELINE_SCALER = load_baseline_artifacts()
     ARTIFACT_LOAD_ERROR = None
+    BASELINE_IMPORTANCES = {
+        name: core.json_safe_float(imp)
+        for name, imp in zip(ALL_FEATURES, BASELINE_MODEL.feature_importances_)
+    } if hasattr(BASELINE_MODEL, "feature_importances_") else None
 except Exception as e:
-    ALL_FEATURES, CORE_FEATURES, REMAINING_FEATURES, BASELINE_MODEL, BASELINE_SCALER = None, None, None, None, None
+    ALL_FEATURES, CORE_FEATURES, REMAINING_FEATURES = None, None, None
+    BASELINE_MODEL, BASELINE_SCALER, BASELINE_IMPORTANCES = None, None, None
     ARTIFACT_LOAD_ERROR = str(e)
 
 
-def _resolve_treatment_column(df, override_col=None):
-    """Best-effort treatment/control column resolution (see
-    psm_core.detect_treatment_column); binarizes it in place on a copy.
-    Returns (df, column_name_or_None, method_or_None)."""
-    col, binarized, method = core.detect_treatment_column(df, override_col=override_col)
-    if col is None:
-        return df, None, None
-    df = df.copy()
-    df[col] = binarized
-    return df, col, method
+# ---------------------------------------------------------------------------
+# Dynamic model -- trained from whatever CSV was last POSTed to /train,
+# persisted so it survives a restart. Teachable-Machine style: every /train
+# call deletes whatever was active and fits a completely fresh model on the
+# new upload. No merging with the previous schema, no reuse-shortcut.
+# ---------------------------------------------------------------------------
+STATE_DIR = os.environ.get("ML_DYNAMIC_STATE_DIR", os.path.join(os.path.dirname(__file__), "models", "dynamic"))
+STATE_MODEL_PATH = os.path.join(STATE_DIR, "model.pkl")
+STATE_META_PATH = os.path.join(STATE_DIR, "meta.json")
+
+STATE = {
+    "model": None,
+    "feature_cols": None,
+    "importances": None,
+    "treatment_col": None,
+    "treatment_method": None,
+    "source_filename": None,
+    "rows": None,
+    "trained_at": None,
+}
+
+MIN_TRAINING_ROWS = 10
+TOP_N_FEATURES = 30
 
 
-def _default_n_flex():
-    return len(REMAINING_FEATURES)
+def load_state():
+    if not (os.path.exists(STATE_MODEL_PATH) and os.path.exists(STATE_META_PATH)):
+        return
+    try:
+        model = joblib.load(STATE_MODEL_PATH)
+        with open(STATE_META_PATH, "r") as f:
+            meta = json.load(f)
+    except Exception:
+        return
+    STATE.update(meta)
+    STATE["model"] = model
+
+
+def save_state():
+    os.makedirs(STATE_DIR, exist_ok=True)
+    joblib.dump(STATE["model"], STATE_MODEL_PATH)
+    meta = {k: v for k, v in STATE.items() if k != "model"}
+    with open(STATE_META_PATH, "w") as f:
+        json.dump(meta, f)
+
+
+load_state()
+
+
+def _resolve_scoring_model(df):
+    """All 57 raw baseline features present -> the frozen baseline (most
+    accurate, always available, needs no training). Otherwise whatever's
+    currently in STATE, or (None, None, None, None) if nothing has been
+    trained yet."""
+    if ALL_FEATURES is not None and all(f in df.columns for f in ALL_FEATURES):
+        return BASELINE_MODEL, ALL_FEATURES, BASELINE_SCALER, "baseline"
+    if STATE["model"] is not None:
+        return STATE["model"], STATE["feature_cols"], None, "dynamic"
+    return None, None, None, None
+
+
+def _score(source, model, feature_cols, scaler, df):
+    """Baseline uses build_model.py's median/mode imputation (matches how it
+    was trained); the dynamic model uses plain .fillna(0) (matches
+    train_psm_model). Returns (ps array, X used)."""
+    if source == "baseline":
+        X = core.impute_dataframe(df, feature_cols)[feature_cols]
+        X_input = scaler.transform(X) if core.model_needs_scaling(model) else X
+    else:
+        X = df[feature_cols].fillna(0)
+        X_input = X
+    ps = model.predict_proba(X_input)[:, 1]
+    return ps, X
+
+
+def _no_model_error(df):
+    total = len(ALL_FEATURES) if ALL_FEATURES else "?"
+    n_covered = len(set(df.columns) & set(ALL_FEATURES)) if ALL_FEATURES else 0
+    return (f"no dynamic model trained yet, and this dataset covers only {n_covered}/{total} baseline "
+            f"features -- POST a CSV to /train first, or include all {total} baseline features")
+
+
+@app.route("/train", methods=["POST"])
+def train():
+    """
+    multipart/form-data:
+      file: <CSV file>               required
+      treatment_column: <col name>   optional -- bypasses auto-detection if
+                                      the heuristic picks the wrong column
+
+    Deletes whatever dynamic model is currently active and trains a
+    completely fresh one on this upload -- Teachable-Machine style. Every
+    call: auto-detects the treatment/control column (see
+    psm_core.detect_treatment_column), ranks every usable numeric column by
+    importance for predicting it (excluding near-perfect treatment proxies,
+    see psm_core._leakage_correlated_columns), keeps the top 30
+    (psm_core.select_top_features), and fits a fresh model on just those
+    (psm_core.train_psm_model). Nothing carries over from whatever was
+    trained before -- there is no merge, no reuse-shortcut.
+
+    /predict_ps, /estimate_att, /predict_ps_batch score against whichever
+    model currently applies: the frozen baseline if the request covers all
+    57 raw features, otherwise this dynamic model, persisted under
+    models/dynamic/ so a restart doesn't lose it.
+    """
+    file = request.files.get("file")
+    if file is None:
+        return jsonify({"error": "multipart form field 'file' (CSV) is required"}), 400
+
+    try:
+        df = pd.read_csv(file)
+    except Exception as e:
+        return jsonify({"error": f"could not parse CSV: {e}"}), 400
+
+    if len(df) < MIN_TRAINING_ROWS:
+        return jsonify({"error": f"dataset too small to train on (need at least {MIN_TRAINING_ROWS} rows, got {len(df)})"}), 400
+
+    override_col = request.form.get("treatment_column") or None
+    try:
+        treatment_col, treatment_binarized, method = core.detect_treatment_column(df, override_col=override_col)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    if treatment_col is None:
+        return jsonify({"error": "could not auto-detect a treatment/control column in this dataset; retry with a 'treatment_column' form field"}), 400
+
+    try:
+        top_features, _, excluded_leakage = core.select_top_features(df, treatment_col, treatment_binarized, top_n=TOP_N_FEATURES)
+        model, final_importances = core.train_psm_model(df, treatment_binarized, top_features)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+
+    STATE.update({
+        "model": model,
+        "feature_cols": top_features,
+        "importances": final_importances,
+        "treatment_col": treatment_col,
+        "treatment_method": method,
+        "source_filename": file.filename,
+        "rows": len(df),
+        "trained_at": time.time(),
+    })
+    save_state()
+
+    ranked = sorted(final_importances.items(), key=lambda kv: kv[1], reverse=True)
+    return jsonify({
+        "status": "trained",
+        "rows": len(df),
+        "treatment_column": treatment_col,
+        "treatment_detection_method": method,
+        "n_features_selected": len(top_features),
+        "top_features": [{"feature": name, "importance": imp} for name, imp in ranked],
+        "excluded_as_leakage": excluded_leakage,
+    })
 
 
 @app.route("/predict_ps", methods=["POST"])
 def predict_ps():
     """
-    JSON body:
-    {
-      "records": [ { "<bfar_column_name>": value, ... }, ... ],
-      "treatment_column": "<name>",   # optional -- only needed if records don't
-                                       # cover all baseline features, and auto-
-                                       # detection picks the wrong column
-      "n_flex": 27                    # optional, default = all "remaining" features
-    }
+    JSON body: { "records": [ { "<column_name>": value, ... }, ... ] }
 
-    If every record together covers all 57 bfar.csv baseline features, scores
-    directly against the frozen baseline model (no fitting at all). Otherwise
-    requires the 30 core baseline features plus a treatment column (to rank
-    this dataset's own extra features against) and at least 10 records; fits
-    a throwaway model for this request only.
+    Scores against the frozen baseline if every record covers all 57 raw
+    bfar features, otherwise against whatever's currently in the dynamic
+    model (see POST /train). 409 if neither applies.
     """
-    if BASELINE_MODEL is None:
-        return jsonify({"error": f"ML artifacts not loaded: {ARTIFACT_LOAD_ERROR}"}), 500
-
     body = request.get_json(force=True, silent=True) or {}
     records = body.get("records")
     if not isinstance(records, list) or len(records) == 0:
         return jsonify({"error": "records must be a non-empty array"}), 400
-
     df = pd.DataFrame(records)
-    df, treatment_col, treatment_method = _resolve_treatment_column(df, override_col=body.get("treatment_column"))
 
-    try:
-        result = core.predict_dynamic(
-            df, CORE_FEATURES, ALL_FEATURES, BASELINE_MODEL, BASELINE_SCALER,
-            treatment_col=treatment_col or "treatment",
-            n_flex=int(body.get("n_flex", _default_n_flex())),
-        )
-    except ValueError as e:
-        return jsonify({"error": str(e)}), 400
+    model, feature_cols, scaler, source = _resolve_scoring_model(df)
+    if model is None:
+        return jsonify({"error": _no_model_error(df)}), 409
 
+    missing = [f for f in feature_cols if f not in df.columns]
+    if missing:
+        return jsonify({"error": f"records missing required features: {missing[:5]}{'...' if len(missing) > 5 else ''}"}), 400
+
+    ps, _X = _score(source, model, feature_cols, scaler, df)
     return jsonify({
-        "ps_final": [core.json_safe_float(v) for v in result["ps"]],
-        "used_baseline": result["used_baseline"],
-        "n_features_used": len(result["final_features"]),
-        "final_features": result["final_features"],
-        "treatment_column": treatment_col,
-        "treatment_detection_method": treatment_method,
+        "ps_final": [core.json_safe_float(v) for v in ps],
+        "source": source,
+        "n_features_used": len(feature_cols),
     })
 
 
 @app.route("/estimate_att", methods=["POST"])
 def estimate_att():
     """
-    JSON body (records must include treatment + outcome):
+    JSON body:
     {
-      "records": [ { "<bfar_column_name>": value, ..., "treatment": 0/1, "outcome": number }, ... ],
-      "treatment_column": "<name>",   # optional -- auto-detected otherwise
-      "outcomeKey": "outcome",        # optional
-      "n_flex": 27,                   # optional
+      "records": [ { "<column_name>": value, ..., "treatment": 0/1, "outcome": number }, ... ],
+      "treatmentKey": "treatment", "outcomeKey": "outcome",  # optional
       "caliper_ratio": 0.2, "n_bootstrap": 500, "seed": 42   # optional
     }
     """
-    if BASELINE_MODEL is None:
-        return jsonify({"error": f"ML artifacts not loaded: {ARTIFACT_LOAD_ERROR}"}), 500
-
     body = request.get_json(force=True, silent=True) or {}
     records = body.get("records")
     if not isinstance(records, list) or len(records) == 0:
         return jsonify({"error": "records must be a non-empty array"}), 400
-
     df = pd.DataFrame(records)
+
+    treatment_key = body.get("treatmentKey", "treatment")
     outcome_key = body.get("outcomeKey", "outcome")
-    override_col = body.get("treatment_column") or body.get("treatmentKey")
-    df, treatment_col, treatment_method = _resolve_treatment_column(df, override_col=override_col)
-
-    if treatment_col is None:
-        return jsonify({"error": "could not auto-detect a treatment/control column in this dataset; retry with a 'treatment_column' field"}), 400
+    if treatment_key not in df.columns:
+        return jsonify({"error": f"missing required field: {treatment_key}"}), 400
     if outcome_key not in df.columns:
-        return jsonify({"error": f"missing required outcome column: {outcome_key}"}), 400
+        return jsonify({"error": f"missing required field: {outcome_key}"}), 400
 
-    result, err = core.estimate_att_dynamic(
-        df, CORE_FEATURES, ALL_FEATURES, BASELINE_MODEL, BASELINE_SCALER,
-        treatment_col=treatment_col, outcome_col=outcome_key,
-        n_flex=int(body.get("n_flex", _default_n_flex())),
+    model, feature_cols, scaler, source = _resolve_scoring_model(df)
+    if model is None:
+        return jsonify({"error": _no_model_error(df)}), 409
+
+    missing = [f for f in feature_cols if f not in df.columns]
+    if missing:
+        return jsonify({"error": f"records missing required features: {missing[:5]}{'...' if len(missing) > 5 else ''}"}), 400
+
+    ps, _X = _score(source, model, feature_cols, scaler, df)
+    ps_logit = core.logit(ps)
+    treatments = df[treatment_key].astype(int).to_numpy()
+    outcomes = pd.to_numeric(df[outcome_key], errors="coerce").to_numpy(dtype=float)
+
+    result, err = core.matched_att(
+        ps_logit, treatments, outcomes,
         caliper_ratio=float(body.get("caliper_ratio", 0.2)),
         n_bootstrap=int(body.get("n_bootstrap", 500)),
         seed=int(body.get("seed", 42)),
@@ -163,28 +290,20 @@ def estimate_att():
     if err:
         return jsonify({"error": err}), 400
 
-    result["treatment_column"] = treatment_col
-    result["treatment_detection_method"] = treatment_method
+    result["source"] = source
+    result["n_features_used"] = len(feature_cols)
     return jsonify(result)
 
 
 @app.route("/predict_ps_batch", methods=["POST"])
 def predict_ps_batch():
     """
-    multipart/form-data:
-      file: <CSV file>               required
-      treatment_column: <col name>   optional -- bypasses auto-detection
-      n_flex: 27                     optional
+    multipart/form-data: file: <CSV file>   required
 
-    Whole-dataset counterpart to /predict_ps (mirrors predictor_psm.ipynb's
-    predict_and_support workflow): scores every row and returns a
-    decision-support table stratified by propensity-score quartile, in
-    addition to the raw per-row scores. Nothing about the baseline is ever
-    changed by this call.
+    Whole-dataset counterpart to /predict_ps: scores every row and returns a
+    decision-support table stratified by propensity-score quartile,
+    alongside the raw per-row scores.
     """
-    if BASELINE_MODEL is None:
-        return jsonify({"error": f"ML artifacts not loaded: {ARTIFACT_LOAD_ERROR}"}), 500
-
     file = request.files.get("file")
     if file is None:
         return jsonify({"error": "multipart form field 'file' (CSV) is required"}), 400
@@ -196,19 +315,17 @@ def predict_ps_batch():
     if len(df) == 0:
         return jsonify({"error": "uploaded CSV has no rows"}), 400
 
-    override_col = request.form.get("treatment_column") or None
-    df, treatment_col, treatment_method = _resolve_treatment_column(df, override_col=override_col)
+    model, feature_cols, scaler, source = _resolve_scoring_model(df)
+    if model is None:
+        return jsonify({"error": _no_model_error(df)}), 409
 
-    try:
-        result = core.predict_dynamic(
-            df, CORE_FEATURES, ALL_FEATURES, BASELINE_MODEL, BASELINE_SCALER,
-            treatment_col=treatment_col or "treatment",
-            n_flex=int(request.form.get("n_flex", _default_n_flex())),
-        )
-    except ValueError as e:
-        return jsonify({"error": str(e)}), 400
+    missing = [f for f in feature_cols if f not in df.columns]
+    if missing:
+        return jsonify({"error": f"CSV missing required features: {missing[:5]}{'...' if len(missing) > 5 else ''}"}), 400
 
-    ps = result["ps"]
+    ps, _X = _score(source, model, feature_cols, scaler, df)
+    ps_logit = core.logit(ps)
+
     key_features = [f for f in KEY_SUPPORT_FEATURES if f in df.columns]
     support_input = df[key_features].copy() if key_features else pd.DataFrame(index=df.index)
     support_input["ps"] = ps
@@ -224,13 +341,10 @@ def predict_ps_batch():
 
     return jsonify({
         "rows": len(df),
-        "used_baseline": result["used_baseline"],
-        "n_features_used": len(result["final_features"]),
-        "final_features": result["final_features"],
-        "treatment_column": treatment_col,
-        "treatment_detection_method": treatment_method,
+        "source": source,
+        "n_features_used": len(feature_cols),
         "ps": [core.json_safe_float(v) for v in ps],
-        "ps_logit": [core.json_safe_float(v) for v in result["ps_logit"]],
+        "ps_logit": [core.json_safe_float(v) for v in ps_logit],
         "ps_summary": {
             "min": core.json_safe_float(np.min(ps)),
             "max": core.json_safe_float(np.max(ps)),
@@ -250,17 +364,34 @@ def health():
             "model_dir": MODEL_DIR,
         }), 500
 
-    return jsonify({
+    response = {
         "status": "ok",
         "model_dir": MODEL_DIR,
-        "psm": {
-            "source": "bfar.csv baseline (models/best_model.pkl) -- adapted per-request for uploads that don't cover all baseline features, never persisted",
+        "baseline": {
+            "source": "bfar.csv (baked-in, static, never retrained)",
             "model_type": type(BASELINE_MODEL).__name__,
-            "n_core_features": len(CORE_FEATURES),
-            "n_remaining_features": len(REMAINING_FEATURES),
-            "n_all_features": len(ALL_FEATURES),
+            "n_features_total": len(ALL_FEATURES),
         },
-    })
+    }
+    if BASELINE_IMPORTANCES is not None:
+        top_features = sorted(BASELINE_IMPORTANCES.items(), key=lambda kv: kv[1], reverse=True)[:30]
+        response["baseline"]["top_features"] = [{"feature": name, "importance": imp} for name, imp in top_features]
+
+    if STATE["model"] is None:
+        response["dynamic"] = {"status": "empty", "message": "no dataset trained yet; POST a CSV to /train"}
+    else:
+        ranked = sorted(STATE["importances"].items(), key=lambda kv: kv[1], reverse=True)
+        response["dynamic"] = {
+            "status": "ok",
+            "source_filename": STATE["source_filename"],
+            "rows": STATE["rows"],
+            "trained_at": STATE["trained_at"],
+            "treatment_column": STATE["treatment_col"],
+            "treatment_detection_method": STATE["treatment_method"],
+            "n_features_selected": len(STATE["feature_cols"]),
+            "top_features": [{"feature": name, "importance": imp} for name, imp in ranked],
+        }
+    return jsonify(response)
 
 
 if __name__ == "__main__":

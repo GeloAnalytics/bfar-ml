@@ -1,83 +1,76 @@
 # ML Flask Service (Propensity Score Matching)
 
-A single Flask service (`app.py`, using shared logic in `psm_core.py`) grounded in a
-frozen **bfar.csv baseline** (`models/best_model.pkl`, `models/scaler.pkl`,
-`models/all_features.json`, `models/core_features.json`, `models/remaining_features.json`
--- produced by `build_model.py`). The service never retrains or overwrites that
-baseline:
+A single Flask service (`app.py`, shared logic in `psm_core.py`) serving two models
+side by side:
 
-- **Records/CSV covers all 57 baseline features** -> scored directly against the
-  frozen baseline model. No fitting happens.
-- **Covers the 30 "core" baseline features but not all 57** -> the core 30 stay
-  fixed, and up to `n_flex` (default 27) of the request's own top-ranked numeric
-  columns fill the remaining slots. A throwaway model is fit **for that one request
-  only** and discarded immediately after -- nothing is ever written back to disk or
-  reused by a later request.
-- **Missing a core feature** -> `400` error.
+| | Baseline | Dynamic |
+|---|---|---|
+| **Trigger** | Request covers all 57 raw bfar.csv columns | Anything else |
+| **Model** | `models/best_model.pkl` -- frozen, produced by `build_model.py` | Whatever `POST /train` last produced |
+| **Retrained on upload?** | Never | Every `/train` call, unconditionally |
+| **Persisted?** | Yes, committed to the repo | Yes, `models/dynamic/` (gitignored runtime state) |
 
-If this repo is dropped into another project as a subfolder (commonly named `ml/`), prefix the commands below with that folder (e.g. `pip install -r ml/requirements.txt`, `python ml/app.py`). All paths resolve relative to each file's own location, so it works the same whether this is the repo root or a nested subfolder -- `bfar.csv` just needs to stay next to `build_model.py`.
+The dynamic model works **Teachable-Machine style**: every `POST /train` call deletes
+whatever model is currently active and trains a completely fresh one on the new
+upload -- ranking every usable column by feature importance and keeping the top 30, no
+merging with the previous schema, no reuse-shortcut. See `DYNAMIC_TRAINING.md` for the
+full design and why this replaced an earlier index-mapping approach.
+
+If this repo is dropped into another project as a subfolder (commonly named `ml/`), prefix the commands below with that folder (e.g. `pip install -r ml/requirements.txt`, `python ml/app.py`). All paths resolve relative to each file's own location -- `bfar.csv` just needs to stay next to `build_model.py`.
 
 ## Integration guide (backend & frontend)
 
-**Architecture.** `app.py` is a plain, unauthenticated Flask HTTP API -- there's no
-API key, session, or user concept anywhere in this repo. Treat this as an internal
-ML layer that your **backend** calls server-to-server, not something a frontend talks
-to directly in production. It binds `0.0.0.0` by default (LAN/container reachable)
-purely so a backend running on a different machine/container can reach it; it is not
-meant to be exposed to the public internet as-is.
+**Architecture.** `app.py` is a plain, unauthenticated Flask HTTP API -- no API key,
+session, or user concept. Treat it as an internal ML layer your **backend** calls
+server-to-server, not something a frontend talks to directly in production. It binds
+`0.0.0.0` by default (LAN/container reachable); it is not meant to be exposed to the
+public internet as-is.
 
 ```
 frontend  -->  your backend  -->  app.py (HOST:PORT from .env, default 0.0.0.0:8000)
 ```
 
-**Configuration (`.env`).** `app.py` loads a `.env` file on startup (via
-`python-dotenv`) -- copy/edit the committed one or set real environment variables in
-your deployment instead:
+**Configuration (`.env`).** Loaded on startup via `python-dotenv`:
 ```bash
 HOST=0.0.0.0
 PORT=8000
-# ML_MODEL_DIR=models   # only needed if artifacts live somewhere other than ./models
+# ML_MODEL_DIR=models             # only if baseline artifacts live somewhere other than ./models
+# ML_DYNAMIC_STATE_DIR=models/dynamic  # only if the trained dynamic model should live elsewhere
 ```
-
-**Base URL.** Nothing in this repo reads this -- it's just the conventional env var
-name to set in whatever backend consumes this service:
-
-| Backend env var | Points at | Local default |
-|---|---|---|
-| `ML_SERVICE_URL` | `app.py` | `http://127.0.0.1:8000` (or your LAN/container address) |
 
 **Error contract.** Every endpoint returns JSON with the same shape:
 - `200` -- success, body is the endpoint-specific payload documented below.
-- `400` -- bad/incomplete input (missing features, unparsable CSV, no treatment column found, dataset too small, ...): `{"error": "<message>"}`. The message is written to be shown to an end user or logged as a validation failure -- it's never a stack trace.
-- `500` -- the service itself failed to load its baseline artifacts at startup: `{"error": "ML artifacts not loaded: <reason>"}`. This is an ops problem (bad `ML_MODEL_DIR`, missing `models/` files), not a user-input problem -- alert on it rather than surfacing it to end users.
+- `400` -- bad/incomplete input (unparsable CSV, no treatment column found, dataset too small, missing required feature columns, ...): `{"error": "<message>"}` -- shown-to-user quality, never a stack trace.
+- `409` -- a scoring endpoint was called but no model applies: the request doesn't cover all 57 baseline features, and nothing has been trained yet. `{"error": "no dynamic model trained yet, ..."}`.
+- `500` -- baseline artifacts failed to load at startup: `{"error": "ML artifacts not loaded: <reason>"}`. Ops problem, not user-input problem -- alert on it.
 
-There is no `401`/`403`/`404`/`409` currently -- if you need auth or
-rate-limiting, add it in your backend's proxy layer, not here.
-
-**CORS.** `app.py` calls `CORS(app)` with no origin restriction, so *any* origin can
-call it directly from a browser as-is. That's fine for local development; if you ever
-let a frontend call this service directly instead of going through your backend,
-restrict this first (`CORS(app, origins=["https://your-frontend"])` in `app.py`) --
-don't rely on network placement alone.
+**CORS.** `CORS(app)` currently allows any origin -- fine for local development; if a
+frontend ever calls this service directly, restrict it first
+(`CORS(app, origins=["https://your-frontend"])`).
 
 **Quick endpoint reference:**
 
 | Method & path | Body | Returns |
 |---|---|---|
-| `GET /health` | -- | baseline status (model type, feature counts) |
-| `POST /predict_ps` | JSON `{records}`, one object per row keyed by bfar column name -- partial feature sets OK | `{ps_final, used_baseline, final_features, treatment_column, ...}` |
-| `POST /estimate_att` | JSON `{records}` with `treatment`+`outcome` per record | matched-ATT result + adaptation metadata |
-| `POST /predict_ps_batch` | multipart CSV upload | per-row `ps` + decision-support quartile table |
+| `GET /health` | -- | baseline status + current dynamic model status |
+| `POST /train` | multipart CSV (`file`, `treatment_column?`) | trained model summary; **replaces** whatever was previously active |
+| `POST /predict_ps` | JSON `{records}` | `{ps_final, source, n_features_used}` |
+| `POST /estimate_att` | JSON `{records}` with `treatment`+`outcome` per record | matched-ATT result |
+| `POST /predict_ps_batch` | multipart CSV (`file`) | per-row `ps` + decision-support quartile table |
 
-Full request/response bodies and examples for each are in the sections below.
+**Response fields:** all three scoring endpoints report `source` (`"baseline"` or
+`"dynamic"`, telling you which model actually served the request) and
+`n_features_used`.
 
-**Running in production.** `app.run(...)` is Flask's development server (it prints
-its own "do not use in production" warning on startup) -- put a real WSGI server in
-front for anything beyond local dev/integration testing, e.g.:
+**Running in production.** `app.run(...)` is Flask's dev server -- put a real WSGI
+server in front:
 ```bash
 pip install waitress   # Windows-friendly; use gunicorn on Linux
 waitress-serve --host=0.0.0.0 --port=8000 app:app
 ```
+Note: the dynamic model is in-process state mirrored to disk. If you scale to
+multiple workers, they won't share a freshly `/train`-ed model until each has
+independently loaded it from `ML_DYNAMIC_STATE_DIR` on its own startup.
 
 ## 1) Install Python dependencies
 
@@ -85,22 +78,26 @@ waitress-serve --host=0.0.0.0 --port=8000 app:app
 pip install -r requirements.txt
 ```
 
-`models/best_model.pkl`, `models/scaler.pkl`, `models/all_features.json`, `models/core_features.json`, and `models/remaining_features.json` are already committed, so no training step is required for normal use. To regenerate them after changing `bfar.csv`:
+The baseline artifacts are committed (`models/best_model.pkl`, `scaler.pkl`,
+`all_features.json`, `core_features.json`, `remaining_features.json`), so no training
+step is required for normal use. To regenerate after changing `bfar.csv`:
 ```bash
 python build_model.py
 ```
-This runs the same 5-fold cross-validated model selection as `updated_psm.ipynb` (Logistic Regression, Random Forest, Gradient Boosting, Neural Network -- picks the lowest-MSE model), fits it on the full dataset, and splits its feature importances into the 30 "core" features (always required for dynamic adaptation) and the 27 "remaining" features (informational baseline ranking only).
+This runs 5-fold cross-validated model selection (Logistic Regression, Random Forest,
+Gradient Boosting, Neural Network -- lowest MSE wins) on the raw 57 features and saves
+the winner as the frozen baseline.
 
 ## 2) Start the service
 
 ```bash
 python app.py
 ```
-Reads `HOST`/`PORT` from `.env` (defaults `0.0.0.0:8000` if unset).
+Reads `HOST`/`PORT` from `.env` (defaults `0.0.0.0:8000`).
 
 ## 3) Endpoints
 
-**How treatment detection works** (`psm_core.detect_treatment_column`): looks for a column literally named `treatment`; failing that, scores every column as either an already-binary flag (0/1, Yes/No, True/False) or a "populated only for one group" column (like `Y_BOAT-RE`, non-null only for program participants), favoring the latter since that's the far more common pattern in program/survey datasets, and breaking ties by earliest column position. This is a heuristic over a genuinely ambiguous problem -- always check `treatment_column`/`treatment_detection_method` in the response, and override with a `treatment_column` field/form-field if it's wrong. Only needed (and only attempted) when the request doesn't already cover all 57 baseline features.
+**How treatment detection works** (`psm_core.detect_treatment_column`, used by `/train`): looks for a column literally named `treatment`; failing that, scores every column as either an already-binary flag (0/1, Yes/No, True/False) or a "populated only for one group" column (like `Y_BOAT-RE`, non-null only for program participants), favoring the latter, breaking ties by earliest column position. A heuristic over a genuinely ambiguous problem -- always check `treatment_column`/`treatment_detection_method` in the response, and override with the `treatment_column` form field if it's wrong.
 
 ### Health
 ```bash
@@ -109,13 +106,48 @@ curl http://localhost:8000/health
 ```json
 {
   "status": "ok",
-  "psm": {
-    "source": "bfar.csv baseline (models/best_model.pkl) -- adapted per-request for uploads that don't cover all baseline features, never persisted",
+  "baseline": {
+    "source": "bfar.csv (baked-in, static, never retrained)",
     "model_type": "GradientBoostingClassifier",
-    "n_core_features": 30,
-    "n_remaining_features": 27,
-    "n_all_features": 57
-  }
+    "n_features_total": 57,
+    "top_features": [{"feature": "E1:A_DRINK-H2O", "importance": 0.084}, "..."]
+  },
+  "dynamic": { "status": "empty", "message": "no dataset trained yet; POST a CSV to /train" }
+}
+```
+After a `/train` call, `dynamic` instead looks like:
+```json
+{
+  "status": "ok",
+  "source_filename": "mydataset.csv",
+  "rows": 412,
+  "trained_at": 1752566400.0,
+  "treatment_column": "enrolled",
+  "treatment_detection_method": "binary_value",
+  "n_features_selected": 30,
+  "top_features": [{"feature": "monthly_income", "importance": 0.11}, "..."]
+}
+```
+
+### Train the dynamic model
+```bash
+curl -X POST http://localhost:8000/train -F "file=@mydataset.csv"
+```
+Optional form field: `treatment_column=enrolled_flag` (bypasses auto-detection).
+
+**Deletes whatever dynamic model is currently active and trains a completely fresh
+one** -- ranks every usable numeric column by importance for predicting the detected
+treatment column (excluding near-perfect treatment proxies), keeps the top 30, fits a
+fresh model. Nothing carries over from any previous `/train` call.
+```json
+{
+  "status": "trained",
+  "rows": 412,
+  "treatment_column": "enrolled",
+  "treatment_detection_method": "binary_value",
+  "n_features_selected": 30,
+  "top_features": [{"feature": "monthly_income", "importance": 0.11}, "..."],
+  "excluded_as_leakage": ["group_assignment_code"]
 }
 ```
 
@@ -123,48 +155,24 @@ curl http://localhost:8000/health
 ```bash
 curl -X POST http://localhost:8000/predict_ps \
   -H "Content-Type: application/json" \
-  -d '{
-    "records": [
-      { "D1.1:A_BIKE": 0, "D1.1-A_QTY": 0, "...": 0 }
-    ]
-  }'
+  -d '{ "records": [ { "monthly_income": 8000, "household_size": 4, "...": 0 } ] }'
 ```
 ```json
-{
-  "ps_final": [0.42],
-  "used_baseline": true,
-  "n_features_used": 57,
-  "final_features": ["D1.1:A_BIKE", "..."],
-  "treatment_column": null,
-  "treatment_detection_method": null
-}
+{ "ps_final": [0.42], "source": "dynamic", "n_features_used": 30 }
 ```
-`used_baseline` is `false` and `treatment_column` is populated when the request didn't cover all 57 features and dynamic adaptation kicked in instead. Optional body fields: `treatment_column` (bypass auto-detection), `n_flex` (default: all 27 "remaining" features).
+Scores against the frozen baseline (`source: "baseline"`) if every record covers all
+57 raw bfar features; otherwise against whatever's currently in the dynamic model
+(`source: "dynamic"`). `409` if neither applies -- train first, or include all 57
+baseline features.
 
 ### Predict propensity scores + decision support (whole CSV)
 ```bash
 curl -X POST http://localhost:8000/predict_ps_batch -F "file=@mydataset.csv"
 ```
-Optional form fields: `treatment_column`, `n_flex`.
-
-Mirrors `predictor_psm.ipynb`'s workflow directly: scores every row and returns a
-decision-support table stratified by propensity-score quartile (Low / Med-Low /
-Med-High / High), alongside the raw per-row scores:
-```json
-{
-  "rows": 1339,
-  "used_baseline": true,
-  "n_features_used": 57,
-  "treatment_column": "Y_BOAT-RE",
-  "treatment_detection_method": "notna_mask",
-  "ps": [0.42, "..."],
-  "ps_logit": [-0.32, "..."],
-  "ps_summary": { "min": 0.04, "max": 0.99, "mean": 0.45, "median": 0.42 },
-  "decision_support": [
-    { "ps_group": "Low", "count": 335, "mean_ps": 0.37, "interpretation": "Very low likelihood - may need targeted outreach", "...": "..." }
-  ]
-}
-```
+Scores every row and adds a decision-support table stratified by propensity-score
+quartile (Low / Med-Low / Med-High / High) with per-group interpretations, plus
+`ps_summary` (min/max/mean/median) -- mirrors `predictor_psm.ipynb`'s
+predict-and-support workflow.
 
 ### Estimate ATT via matching (JSON records)
 ```bash
@@ -172,21 +180,17 @@ curl -X POST http://localhost:8000/estimate_att \
   -H "Content-Type: application/json" \
   -d '{
     "records": [
-      { "D1.1:A_BIKE": 0, "D1.1-A_QTY": 0, "treatment": 1, "outcome": 12000 },
-      { "D1.1:A_BIKE": 0, "D1.1-A_QTY": 0, "treatment": 0, "outcome": 9000 }
+      { "monthly_income": 8000, "...": 0, "treatment": 1, "outcome": 12000 },
+      { "monthly_income": 7500, "...": 0, "treatment": 0, "outcome": 9000 }
     ],
-    "caliper_ratio": 0.2,
-    "n_bootstrap": 200,
-    "seed": 42
+    "caliper_ratio": 0.2, "n_bootstrap": 200, "seed": 42
   }'
 ```
-Records don't need to cover all 57 features -- the same core+flex dynamic adaptation
-applies here, using each record's own `treatment`/`outcome` fields to both rank flex
-features and compute the matched ATT (the `outcome` column itself is always excluded
-from candidate features, so it can never leak into the model). Optional body fields:
-`treatment_column`, `outcomeKey` (default `"outcome"`), `n_flex`, `caliper_ratio`,
-`n_bootstrap`, `seed`.
+Returns `matched_pairs`, `att_mean`, `ci_95`, `p_value_paired_ttest`, `caliper`, plus
+`source`/`n_features_used`. The `outcome` column is never treated as a candidate
+feature. Optional body fields: `treatmentKey` (default `"treatment"`), `outcomeKey`
+(default `"outcome"`), `caliper_ratio`, `n_bootstrap`, `seed`.
 
 ## Notebooks
 
-`updated_psm.ipynb` and `predictor_psm.ipynb` (not part of this repo, kept alongside it) contain the fuller research workflow this service's baseline is drawn from -- model selection with ROC/calibration plots, balance diagnostics, SHAP explainability, and IPW-based ATT estimation as a cross-check against the matching-based estimate served here. The live API intentionally exposes only the baseline-scoring and dynamic-adaptation pieces of that workflow; SHAP and IPW remain notebook-only analysis steps.
+`updated_psm.ipynb` and `predictor_psm.ipynb` (not part of this repo, kept alongside it) contain the fuller research workflow the baseline model is drawn from -- model selection with ROC/calibration plots, balance diagnostics, SHAP explainability, and IPW-based ATT estimation as a cross-check against the matching-based estimate served here. The live API intentionally exposes only baseline-scoring and dynamic training/scoring; SHAP and IPW remain notebook-only analysis steps.

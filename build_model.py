@@ -3,12 +3,12 @@
 Mirrors the model-selection methodology from updated_psm.ipynb: 5-fold CV across
 four candidate classifiers (Logistic Regression, Random Forest, Gradient Boosting,
 Neural Network), picks the lowest-MSE model, fits it on the full dataset, and
-splits its feature importances into a fixed 30-feature "core" set (always required
-by per-request dynamic adaptation, see psm_core.predict_dynamic) and a 27-feature
-"remaining" set (informational only -- new datasets may substitute their own
-equally-ranked features in these slots instead).
+splits its feature importances into the top-30 "core" features (informational --
+shown in app.py's /health) and the remaining 27.
 
-Run this whenever bfar.csv changes; app.py never retrains these artifacts itself.
+This produces app.py's fixed bfar.csv reference baseline. The separate dynamic
+model (trained per-upload via POST /train, see psm_core.select_top_features /
+train_psm_model) is unrelated to this script and is never touched by it.
 """
 import json
 import os
