@@ -12,49 +12,52 @@ CORS(app)
 # Paths to model artifacts. Override ML_MODEL_DIR when artifacts are mounted
 # outside the repo, such as in production or a notebook export folder.
 MODEL_DIR = os.environ.get("ML_MODEL_DIR", os.path.join(os.path.dirname(__file__), "models"))
-MODEL_PATH = os.path.join(MODEL_DIR, "gradient_boosting_ps_model.pkl")
-FEATURES_PATH = os.path.join(MODEL_DIR, "pre_features.json")
+MODEL_PATH = os.path.join(MODEL_DIR, "best_model.pkl")
+SCALER_PATH = os.path.join(MODEL_DIR, "scaler.pkl")
+ALL_FEATURES_PATH = os.path.join(MODEL_DIR, "all_features.json")
 
 
 def load_artifacts():
-    if not os.path.exists(MODEL_PATH):
-        raise FileNotFoundError(f"Missing model artifact: {MODEL_PATH}")
-    if not os.path.exists(FEATURES_PATH):
-        raise FileNotFoundError(f"Missing feature list artifact: {FEATURES_PATH}")
+    for path in (MODEL_PATH, SCALER_PATH, ALL_FEATURES_PATH):
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"Missing model artifact: {path}")
 
-    with open(FEATURES_PATH, "r") as f:
-        pre_features = json.load(f)
+    with open(ALL_FEATURES_PATH, "r") as f:
+        all_features = json.load(f)
 
     model = joblib.load(MODEL_PATH)
-    return pre_features, model
+    scaler = joblib.load(SCALER_PATH)
+    return all_features, model, scaler
 
 
 # Load on startup. This service always serves the artifacts already baked
-# into models/ (trained on bfar.csv) -- it's the known-good reference to
-# check against, not a target for arbitrary datasets. See app_dynamic.py
-# for the service that trains on uploaded data.
+# into models/ (trained on bfar.csv via build_model.py) -- it's the known-good
+# baseline to check against, not a target for arbitrary datasets. See
+# app_dynamic.py for the service that adapts to uploaded data.
 try:
-    PRE_FEATURES, GB_MODEL = load_artifacts()
+    ALL_FEATURES, MODEL, SCALER = load_artifacts()
     ARTIFACT_LOAD_ERROR = None
+    NEEDS_SCALING = core.model_needs_scaling(MODEL)
     FEATURE_IMPORTANCES = {
         name: core.json_safe_float(imp)
-        for name, imp in zip(PRE_FEATURES, GB_MODEL.feature_importances_)
-    }
+        for name, imp in zip(ALL_FEATURES, MODEL.feature_importances_)
+    } if hasattr(MODEL, "feature_importances_") else None
 except Exception as e:
-    PRE_FEATURES, GB_MODEL, FEATURE_IMPORTANCES = None, None, None
+    ALL_FEATURES, MODEL, SCALER, NEEDS_SCALING, FEATURE_IMPORTANCES = None, None, None, False, None
     ARTIFACT_LOAD_ERROR = str(e)
 
 
 @app.route("/predict_ps", methods=["POST"])
 def predict_ps():
-    if GB_MODEL is None:
+    if MODEL is None:
         return jsonify({"error": f"ML artifacts not loaded: {ARTIFACT_LOAD_ERROR}"}), 500
 
     body = request.get_json(force=True, silent=True) or {}
     ps_final, err = core.predict_ps(
-        GB_MODEL, PRE_FEATURES, body.get("records"),
+        MODEL, ALL_FEATURES, body.get("records"),
         featureMap=body.get("featureMap"),
         auto_infer=core.as_bool(body.get("auto_infer"), default=True),
+        scaler=SCALER if NEEDS_SCALING else None,
     )
     if err:
         return jsonify({"error": err}), 400
@@ -82,12 +85,12 @@ def estimate_att():
       "outcomeKey": "outcome"                                    # optional
     }
     """
-    if GB_MODEL is None:
+    if MODEL is None:
         return jsonify({"error": f"ML artifacts not loaded: {ARTIFACT_LOAD_ERROR}"}), 500
 
     body = request.get_json(force=True, silent=True) or {}
     result, err = core.estimate_att(
-        GB_MODEL, PRE_FEATURES, body.get("records"),
+        MODEL, ALL_FEATURES, body.get("records"),
         featureMap=body.get("featureMap"),
         auto_infer=core.as_bool(body.get("auto_infer"), default=True),
         caliper_ratio=float(body.get("caliper_ratio", 0.2)),
@@ -95,6 +98,7 @@ def estimate_att():
         seed=int(body.get("seed", 42)),
         treatmentKey=body.get("treatmentKey", "treatment"),
         outcomeKey=body.get("outcomeKey", "outcome"),
+        scaler=SCALER if NEEDS_SCALING else None,
     )
     if err:
         return jsonify({"error": err}), 400
@@ -103,23 +107,26 @@ def estimate_att():
 
 @app.route("/health", methods=["GET"])
 def health():
-    if GB_MODEL is None:
+    if MODEL is None:
         return jsonify({
             "status": "degraded",
             "artifact_error": ARTIFACT_LOAD_ERROR,
             "model_dir": MODEL_DIR
         }), 500
 
-    top_features = sorted(FEATURE_IMPORTANCES.items(), key=lambda kv: kv[1], reverse=True)[:30]
-    return jsonify({
+    response = {
         "status": "ok",
         "model_dir": MODEL_DIR,
         "psm": {
             "source": "bfar.csv (baked-in, static)",
-            "n_features_total": len(PRE_FEATURES),
-            "top_features": [{"feature": name, "importance": imp} for name, imp in top_features],
+            "model_type": type(MODEL).__name__,
+            "n_features_total": len(ALL_FEATURES),
         },
-    })
+    }
+    if FEATURE_IMPORTANCES is not None:
+        top_features = sorted(FEATURE_IMPORTANCES.items(), key=lambda kv: kv[1], reverse=True)[:30]
+        response["psm"]["top_features"] = [{"feature": name, "importance": imp} for name, imp in top_features]
+    return jsonify(response)
 
 
 if __name__ == "__main__":

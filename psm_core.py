@@ -1,5 +1,12 @@
 """Shared propensity-score-matching (PSM) logic used by both Flask services:
 app.py (static, bfar.csv-only) and app_dynamic.py (arbitrary uploaded datasets).
+
+Both services are grounded in the same frozen bfar.csv baseline (models/best_model.pkl,
+models/scaler.pkl, models/all_features.json, models/core_features.json,
+models/remaining_features.json -- produced by build_model.py). Neither service ever
+retrains or overwrites that baseline: app.py always scores against it directly, and
+app_dynamic.py's dynamic feature adaptation (see predict_dynamic) fits a throwaway
+model per request, scoped to that request only.
 """
 import re
 from difflib import SequenceMatcher
@@ -8,6 +15,7 @@ import numpy as np
 import pandas as pd
 from sklearn.ensemble import GradientBoostingClassifier
 from sklearn.neighbors import NearestNeighbors
+from sklearn.preprocessing import StandardScaler
 from scipy.stats import ttest_rel
 
 
@@ -16,6 +24,17 @@ _TREATMENT_NAME_HINTS = (
     "treat", "program", "particip", "enroll", "assist", "benefic",
     "recipient", "grant", "subsid", "loan", "interven",
 )
+# Model types whose training data was standardized -- their predict_proba
+# expects scaled input too. Tree/boosting models split on raw thresholds
+# learned during training, so scaling them at predict time silently corrupts
+# results (verified empirically against bfar_with_ps.csv: applying the saved
+# scaler to the saved GradientBoostingClassifier moves predictions off the
+# ground truth, while skipping it reproduces it exactly).
+_SCALING_REQUIRED_MODELS = {"MLPClassifier"}
+# Fitting a classifier to rank flex features on a handful of rows produces
+# noise, not a ranking -- mirrors the old /train endpoint's MIN_TRAINING_ROWS
+# guard.
+MIN_DYNAMIC_ADAPT_ROWS = 10
 
 
 def json_safe_float(value):
@@ -125,152 +144,160 @@ def detect_treatment_column(df, exclude_cols=None, override_col=None):
     return name, binarized, method
 
 
-def _numeric_candidate_columns(df, exclude):
-    return [
-        c for c in df.columns
-        if c not in exclude
-        and pd.api.types.is_numeric_dtype(df[c])
-        and not _is_id_like(df[c], c)
-    ]
+def model_needs_scaling(model):
+    """Whether `model`'s predict_proba expects standardized input (see
+    _SCALING_REQUIRED_MODELS)."""
+    return type(model).__name__ in _SCALING_REQUIRED_MODELS
 
 
-def _leakage_correlated_columns(df, treatment_col, treatment_binarized, candidate_cols, threshold=0.95):
-    """
-    Excludes candidates that are near-direct proxies for treatment, via two
-    checks:
-      - null-pattern correlation: when treatment is detected via
-        "notna_mask" (populated only for participants), whole blocks of
-        follow-up questions are typically skipped for non-participants using
-        that same logic -- those columns re-encode "was this question
-        reached" rather than a genuine pre-treatment covariate.
-      - raw-value correlation: a column whose values almost perfectly
-        determine treatment status is very likely a renamed/recoded copy of
-        the treatment/control group assignment itself (seen in bfar.csv as
-        'A2:GROUP', correlation 1.0 with 'Y_BOAT-RE'). Even setting leakage
-        aside, PSM requires overlapping propensity distributions between
-        groups ("common support"); a feature that near-perfectly separates
-        the groups violates that and shouldn't drive the propensity model.
-    """
-    treatment_mask = df[treatment_col].isna().astype(int)
-    check_null_pattern = treatment_mask.nunique() == 2
-    treatment_values = treatment_binarized.to_numpy(dtype=float)
-
-    leaky = set()
-    for col in candidate_cols:
-        if check_null_pattern:
-            col_mask = df[col].isna().astype(int)
-            if col_mask.nunique() == 2:
-                corr = abs(np.corrcoef(treatment_mask, col_mask)[0, 1])
-                if np.isfinite(corr) and corr >= threshold:
-                    leaky.add(col)
-                    continue
-
-        col_values = df[col].fillna(0).to_numpy(dtype=float)
-        if np.std(col_values) > 0:
-            corr = abs(np.corrcoef(col_values, treatment_values)[0, 1])
-            if np.isfinite(corr) and corr >= threshold:
-                leaky.add(col)
-
-    return leaky
-
-
-def match_feature_columns(feature_cols, available_columns):
-    """
-    For each name in `feature_cols`, finds an exact or normalized-name match
-    in `available_columns`. Returns a dict {feature_name: matched_column_or_None}.
-    Used to check how much of an existing model's schema is actually present
-    in a freshly uploaded dataset, before deciding whether retraining is
-    even necessary.
-    """
-    available_norm = {_normalize_key(c): c for c in available_columns}
-    matches = {}
-    for name in feature_cols:
-        if name in available_columns:
-            matches[name] = name
+def impute_dataframe(df, columns):
+    """Median-impute numeric columns, mode-impute object columns. Returns a
+    copy; leaves columns not present in `df` untouched."""
+    df = df.copy()
+    for col in columns:
+        if col not in df.columns:
+            continue
+        if df[col].dtype == "object":
+            mode = df[col].mode()
+            df[col] = df[col].fillna(mode.iloc[0] if len(mode) else "")
         else:
-            matches[name] = available_norm.get(_normalize_key(name))
-    return matches
+            df[col] = df[col].fillna(df[col].median())
+    return df
 
 
-def select_top_features(df, treatment_col, treatment_binarized, top_n=30):
+def select_flex_features(df, core_features, treatment_binarized, exclude=(), n_flex=27):
     """
-    Fits a GradientBoostingClassifier on every numeric candidate column
-    (minus leakage-correlated ones, see _leakage_correlated_columns) to rank
-    importance for predicting `treatment_binarized`. Returns
-    (top_n feature names, name->importance dict for every ranked candidate,
-    sorted list of columns excluded as leakage-correlated).
+    Ranks numeric columns outside `core_features`/`exclude` by importance for
+    predicting `treatment_binarized`, via a throwaway GradientBoostingClassifier
+    fit on core+candidates jointly (importances are read relative to that
+    joint fit, matching predictor_psm.ipynb's dynamic selection exactly --
+    ranking candidates in isolation would give different scores). Returns up
+    to `n_flex` candidate column names, highest importance first.
     """
-    ranked, leaky = _rank_candidate_features(df, treatment_col, treatment_binarized)
-    top = ranked[:top_n]
-    return [name for name, _ in top], {name: json_safe_float(imp) for name, imp in ranked}, sorted(leaky)
-
-
-def _rank_candidate_features(df, treatment_col, treatment_binarized):
-    candidate_cols = _numeric_candidate_columns(df, exclude={treatment_col})
-    leaky = _leakage_correlated_columns(df, treatment_col, treatment_binarized, candidate_cols)
-    candidate_cols = [c for c in candidate_cols if c not in leaky]
+    exclude_set = set(core_features) | set(exclude)
+    candidate_cols = [
+        c for c in df.columns
+        if c not in exclude_set and pd.api.types.is_numeric_dtype(df[c])
+    ]
     if not candidate_cols:
-        raise ValueError("no usable feature columns found (all numeric candidates were the treatment column or leakage-correlated with it)")
+        return []
 
-    X = df[candidate_cols].fillna(0).to_numpy(dtype=float)
-    y = treatment_binarized.to_numpy()
+    combined = core_features + candidate_cols
+    X_temp = impute_dataframe(df, combined)[combined]
+    gb_temp = GradientBoostingClassifier(n_estimators=100, learning_rate=0.1, max_depth=3, random_state=42)
+    gb_temp.fit(X_temp, treatment_binarized)
 
-    ranker = GradientBoostingClassifier(n_estimators=100, learning_rate=0.1, max_depth=3, random_state=42)
-    ranker.fit(X, y)
-
-    ranked = sorted(zip(candidate_cols, ranker.feature_importances_), key=lambda p: p[1], reverse=True)
-    return ranked, leaky
+    importances = pd.Series(gb_temp.feature_importances_, index=combined)
+    ranked_candidates = importances[candidate_cols].sort_values(ascending=False)
+    return ranked_candidates.head(min(n_flex, len(ranked_candidates))).index.tolist()
 
 
-def select_or_merge_features(df, treatment_col, treatment_binarized, previous_features=None, top_n=30):
+def predict_dynamic(df, core_features, all_features, baseline_model, baseline_scaler,
+                     treatment_col="treatment", n_flex=27, exclude_cols=()):
     """
-    Like select_top_features, but when `previous_features` (an existing
-    model's schema) is given, keeps whichever of those are still present and
-    usable in `df`, and only backfills the remaining slots with this
-    dataset's own top-ranked features -- rather than discarding a proven
-    feature set every time a new file comes in. Falls back to a plain
-    top-`top_n` selection when no previous schema is given, or when none of
-    it carries over (e.g. a structurally unrelated dataset).
+    Baseline-first propensity score prediction. bfar.csv is the fixed
+    baseline (models/best_model.pkl + models/scaler.pkl + models/*_features.json,
+    trained once by build_model.py, never touched again by either service):
 
-    Returns (final_features, importances_dict_for_ranked, leaky_excluded,
-    breakdown) where breakdown = {"kept_from_previous": [...],
-    "added_new": [...], "dropped_from_previous": [...]}.
+      - Dataset covers all of `all_features` -> `baseline_model` scores it
+        directly. No fitting happens on this request at all.
+      - Dataset covers `core_features` but not all of `all_features` -> core
+        stays fixed, and up to `n_flex` of the dataset's OWN top-ranked
+        numeric columns (by importance for `treatment_col`, see
+        select_flex_features) fill out the remaining slots; a throwaway model
+        is fit on core+flex for THIS request only and discarded afterwards --
+        nothing is ever written back to the baseline or reused by a later
+        request. Requires `treatment_col` to be present (there is no labeled
+        target to rank candidate features against otherwise). `exclude_cols`
+        is subtracted from flex candidates too -- callers with a separate
+        outcome column (estimate_att_dynamic) must pass it here, or it'll get
+        picked as a "predictor" of treatment, which is nonsense.
+      - Missing a core feature -> raises ValueError.
+
+    The baseline branch does NOT require `treatment_col` -- real-world
+    /predict_ps calls are usually scoring someone whose treatment status is
+    exactly what's unknown, and the fixed baseline model needs no labels to
+    run. This is a deliberate relaxation of predictor_psm.ipynb (which
+    requires the column unconditionally); the dynamic-adaptation branch below
+    still requires it, since it can't be avoided there.
+
+    Returns a dict: {ps, ps_logit, used_baseline, final_features, model, X}.
+    `model`/`X` (a DataFrame indexed like `df`) let callers reuse the exact
+    fitted model/matrix for further work (e.g. matched ATT) instead of
+    re-deriving them.
     """
-    ranked, leaky = _rank_candidate_features(df, treatment_col, treatment_binarized)
-    ranked_names = [name for name, _ in ranked]
-    importance_by_name = dict(ranked)
+    cols_present = set(df.columns)
+    missing_core = [f for f in core_features if f not in cols_present]
+    if missing_core:
+        raise ValueError(
+            f"missing core baseline features: {missing_core[:5]}{'...' if len(missing_core) > 5 else ''}"
+        )
 
-    if not previous_features:
-        top = ranked_names[:top_n]
-        return top, {name: json_safe_float(imp) for name, imp in ranked}, sorted(leaky), {
-            "kept_from_previous": [], "added_new": top, "dropped_from_previous": [],
-        }
+    used_baseline = all(f in cols_present for f in all_features)
 
-    usable_previous = [f for f in previous_features if f in importance_by_name]
+    if used_baseline:
+        final_features = all_features
+        X = impute_dataframe(df, final_features)[final_features]
+        model = baseline_model
+        X_input = baseline_scaler.transform(X) if model_needs_scaling(model) else X
+    else:
+        if treatment_col not in df.columns:
+            n_covered = len(cols_present & set(all_features))
+            raise ValueError(
+                f"dataset covers only {n_covered}/{len(all_features)} baseline features; selecting "
+                f"extra features from this dataset requires a '{treatment_col}' column to rank them "
+                f"against -- include it, or upload all {len(all_features)} baseline features."
+            )
+        if len(df) < MIN_DYNAMIC_ADAPT_ROWS:
+            raise ValueError(
+                f"dataset has only {len(df)} row(s); selecting extra features dynamically needs at "
+                f"least {MIN_DYNAMIC_ADAPT_ROWS} rows to rank them reliably -- upload all "
+                f"{len(all_features)} baseline features instead, or provide a larger dataset."
+            )
+        treatment_binarized = df[treatment_col].astype(int)
+        flex = select_flex_features(df, core_features, treatment_binarized,
+                                     exclude={treatment_col} | set(exclude_cols), n_flex=n_flex)
+        final_features = core_features + flex
+        X = impute_dataframe(df, final_features)[final_features]
+        scaler = StandardScaler()
+        X_input = scaler.fit_transform(X)
+        model = GradientBoostingClassifier(n_estimators=200, learning_rate=0.1, max_depth=5, random_state=42)
+        model.fit(X_input, treatment_binarized)
 
-    # Keep as many previous features as fit, prioritizing the ones that are
-    # still most important in this dataset (not just insertion order).
-    usable_previous.sort(key=lambda f: importance_by_name[f], reverse=True)
-    kept = usable_previous[:top_n]
-    dropped = [f for f in previous_features if f not in kept]
-
-    remaining_slots = top_n - len(kept)
-    added = [name for name in ranked_names if name not in kept][:max(remaining_slots, 0)]
-
-    final_features = kept + added
-    return final_features, {name: json_safe_float(imp) for name, imp in ranked}, sorted(leaky), {
-        "kept_from_previous": kept, "added_new": added, "dropped_from_previous": dropped,
+    ps = model.predict_proba(X_input)[:, 1]
+    return {
+        "ps": ps,
+        "ps_logit": logit(ps),
+        "used_baseline": used_baseline,
+        "final_features": final_features,
+        "model": model,
+        "X": X,
     }
 
 
-def train_psm_model(df, treatment_binarized, feature_cols):
-    """Fits the final propensity-score model on just `feature_cols`."""
-    X = df[feature_cols].fillna(0).to_numpy(dtype=float)
-    y = treatment_binarized.to_numpy()
-    model = GradientBoostingClassifier(n_estimators=100, learning_rate=0.1, max_depth=3, random_state=42)
-    model.fit(X, y)
-    importances = {name: json_safe_float(imp) for name, imp in zip(feature_cols, model.feature_importances_)}
-    return model, importances
+def decision_support_table(df_with_ps, key_features=None, ps_col="ps"):
+    """
+    Stratifies rows into PS quartiles and summarizes each group -- the
+    "which beneficiaries look like priority cases" view from
+    predictor_psm.ipynb's decision-support step.
+    """
+    quartiles = pd.qcut(df_with_ps[ps_col], q=4, labels=["Low", "Med-Low", "Med-High", "High"], duplicates="drop")
+    df = df_with_ps.copy()
+    df["ps_group"] = quartiles
+
+    key_features = [f for f in (key_features or []) if f in df.columns]
+    agg = {"Count": (ps_col, "count"), "Mean_PS": (ps_col, "mean")}
+    agg.update({f"Mean_{f}": (f, "mean") for f in key_features})
+    table = df.groupby("ps_group", observed=False).agg(**agg).reset_index()
+
+    interpretation = {
+        "Low": "Very low likelihood - may need targeted outreach",
+        "Med-Low": "Below average - consider monitoring",
+        "Med-High": "Above average - likely beneficiaries",
+        "High": "High likelihood - priority for intervention",
+    }
+    table["Interpretation"] = table["ps_group"].map(interpretation)
+    return table
 
 
 def logit(p):
@@ -296,12 +323,6 @@ def _infer_feature_map(feature_cols, incoming_feature_keys):
         if best is not None and best_score >= 0.72:
             mapping[mf] = best
     return mapping
-
-
-def _extract_value(r, key):
-    if isinstance(r, dict) and key in r:
-        return r[key]
-    return None
 
 
 def validate_records(records, feature_cols, require_treatment=False, require_outcome=False,
@@ -375,35 +396,24 @@ def build_X_from_records(records, feature_cols, featureMap=None, auto_infer=True
     return np.asarray(X, dtype=float), None
 
 
-def predict_ps(model, feature_cols, records, featureMap=None, auto_infer=True):
+def predict_ps(model, feature_cols, records, featureMap=None, auto_infer=True, scaler=None):
     err = validate_records(records, feature_cols)
     if err:
         return None, err
     X, x_err = build_X_from_records(records, feature_cols, featureMap, auto_infer)
     if x_err:
         return None, x_err
-    ps_final = model.predict_proba(X)[:, 1]
+    X_input = scaler.transform(X) if scaler is not None else X
+    ps_final = model.predict_proba(X_input)[:, 1]
     return ps_final.tolist(), None
 
 
-def estimate_att(model, feature_cols, records, featureMap=None, auto_infer=True,
-                  caliper_ratio=0.2, n_bootstrap=500, seed=42,
-                  treatmentKey="treatment", outcomeKey="outcome"):
-    err = validate_records(records, feature_cols, require_treatment=True, require_outcome=True,
-                            treatmentKey=treatmentKey, outcomeKey=outcomeKey)
-    if err:
-        return None, err
-
-    treatments = np.asarray([int(r[treatmentKey]) for r in records], dtype=int)
-    outcomes = np.asarray([float(r[outcomeKey]) for r in records], dtype=float)
-
-    X, x_err = build_X_from_records(records, feature_cols, featureMap, auto_infer)
-    if x_err:
-        return None, x_err
-
-    ps_final = model.predict_proba(X)[:, 1]
-    ps_logit_final = logit(ps_final)
-
+def _matched_att(ps_logit_final, treatments, outcomes, caliper_ratio=0.2, n_bootstrap=500, seed=42):
+    """Nearest-neighbor PS matching (within a logit-scale caliper) + paired
+    t-test + bootstrap CI for the ATT. Shared by both the static/records path
+    (estimate_att) and the dynamic per-request path (estimate_att_dynamic) --
+    everything upstream of this just needs to produce a ps_logit array plus
+    aligned treatment/outcome arrays."""
     caliper = caliper_ratio * np.std(ps_logit_final)
     if not np.isfinite(caliper) or caliper <= 0:
         return None, "invalid caliper computed from input data"
@@ -465,3 +475,53 @@ def estimate_att(model, feature_cols, records, featureMap=None, auto_infer=True,
         "p_value_paired_ttest": json_safe_float(p_val),
         "caliper": json_safe_float(caliper),
     }, None
+
+
+def estimate_att(model, feature_cols, records, featureMap=None, auto_infer=True,
+                  caliper_ratio=0.2, n_bootstrap=500, seed=42,
+                  treatmentKey="treatment", outcomeKey="outcome", scaler=None):
+    err = validate_records(records, feature_cols, require_treatment=True, require_outcome=True,
+                            treatmentKey=treatmentKey, outcomeKey=outcomeKey)
+    if err:
+        return None, err
+
+    treatments = np.asarray([int(r[treatmentKey]) for r in records], dtype=int)
+    outcomes = np.asarray([float(r[outcomeKey]) for r in records], dtype=float)
+
+    X, x_err = build_X_from_records(records, feature_cols, featureMap, auto_infer)
+    if x_err:
+        return None, x_err
+
+    X_input = scaler.transform(X) if scaler is not None else X
+    ps_final = model.predict_proba(X_input)[:, 1]
+    ps_logit_final = logit(ps_final)
+
+    return _matched_att(ps_logit_final, treatments, outcomes, caliper_ratio, n_bootstrap, seed)
+
+
+def estimate_att_dynamic(df, core_features, all_features, baseline_model, baseline_scaler,
+                          treatment_col="treatment", outcome_col="outcome", n_flex=27,
+                          caliper_ratio=0.2, n_bootstrap=500, seed=42):
+    """Dynamic-service counterpart to estimate_att: takes a whole DataFrame
+    (already has treatment+outcome columns, unlike a real predict_ps caller),
+    resolves baseline-vs-ephemeral-adapt via predict_dynamic, then runs the
+    same matched-ATT computation."""
+    if treatment_col not in df.columns or outcome_col not in df.columns:
+        return None, f"dataset must include '{treatment_col}' and '{outcome_col}' columns"
+
+    try:
+        result = predict_dynamic(df, core_features, all_features, baseline_model, baseline_scaler,
+                                  treatment_col=treatment_col, n_flex=n_flex, exclude_cols={outcome_col})
+    except ValueError as e:
+        return None, str(e)
+
+    treatments = df[treatment_col].astype(int).to_numpy()
+    outcomes = pd.to_numeric(df[outcome_col], errors="coerce").to_numpy(dtype=float)
+
+    att_result, err = _matched_att(result["ps_logit"], treatments, outcomes, caliper_ratio, n_bootstrap, seed)
+    if err:
+        return None, err
+
+    att_result["used_baseline"] = result["used_baseline"]
+    att_result["final_features"] = result["final_features"]
+    return att_result, None

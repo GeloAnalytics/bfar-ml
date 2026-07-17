@@ -1,43 +1,142 @@
+"""Trains the frozen bfar.csv baseline artifacts served by app.py and app_dynamic.py.
+
+Mirrors the model-selection methodology from updated_psm.ipynb: 5-fold CV across
+four candidate classifiers (Logistic Regression, Random Forest, Gradient Boosting,
+Neural Network), picks the lowest-MSE model, fits it on the full dataset, and
+splits its feature importances into a fixed 30-feature "core" set (always required
+by the dynamic service's per-request adaptation, see psm_core.predict_dynamic) and
+a 27-feature "remaining" set (informational only -- new datasets may substitute
+their own equally-ranked features in these slots instead).
+
+Run this whenever bfar.csv changes; neither app.py nor app_dynamic.py ever
+retrains these artifacts themselves.
+"""
+import json
+import os
+
+import joblib
 import numpy as np
 import pandas as pd
-import json
-import joblib
-import os
-from sklearn.ensemble import GradientBoostingClassifier
+from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import brier_score_loss, mean_absolute_error, mean_squared_error, roc_auc_score
+from sklearn.model_selection import StratifiedKFold, cross_val_predict
+from sklearn.neural_network import MLPClassifier
+from sklearn.preprocessing import StandardScaler
 
-# Pre-Program Features
-pre_features = [
-  'D1.1:A_BIKE', 'D1.1-A_QTY', 'D1.2:A_MOTORC', 'D1.2-A_QTY',
-  'D1.3:A_TRICYCLE', 'D1.3-A_QTY', 'D1.4:A_CAR', 'D1.4-A_QTY',
-  'D1.5:A_JEEP', 'D1.5-A_QTY', 'D1.6:A_TRUCK', 'D1.6-A_QTY',
-  'D1.7:A_OTHERS', 'D1.7-A_QTY', 'D2.1:A_TV', 'D2.1-A_QTY',
-  'D2.2:A_DVD', 'D2.2-A_QTY', 'D2.3:A_WASH-M', 'D2.3-A_QTY',
-  'D2.4:A_AC', 'D2.4-A_QTY', 'D2.5:A_E-FAN', 'D2.5-A_QTY',
-  'D2.6:A_FRIDGE', 'D2.6-A_QTY', 'D2.7:A_STOVE', 'D2.7-A_QTY',
-  'D2.8:A_E-HEATER', 'D2.8-A_QTY', 'D2.9:A_FURNITURE', 'D2.9-A_QTY',
-  'D2.10:A_OTHERS', 'D2.10-A_QTY', 'D3.1:A_CP', 'D3.1-A_QTY',
-  'D3.2:A_LANDLINE', 'D3.2-A_QTY', 'D3.3:A_COMPUTER', 'D3.3-A_QTY',
-  'D3.4:A_OTHERS', 'D3.4-A_QTY', 'E1:A_DRINK-H2O', 'E2:A_DOMESTIC-H2O',
-  'E3:A_POWER-SUP', 'E4:A_COOK-FUEL', 'E5:A_NET-SUBS', 'F1:A_HOUSE-OWN',
-  'F2:A_HOUSE-ACQ', 'F3:A_HOUSE-BUILT', 'F4:A_OTHER-RP', 'G1:A_SSS',
-  'G2:A_GSIS', 'G3:A_PhilHealth', 'G4:A_PN-IN', 'G5:A_LIFE-IN', 'G6:A_HEALTH-IN'
+import psm_core as core
+
+# Pre-program features (57) -- present before program enrollment, so safe to
+# use as propensity-score predictors without leaking post-treatment info.
+ALL_FEATURES = [
+    'D1.1:A_BIKE', 'D1.1-A_QTY', 'D1.2:A_MOTORC', 'D1.2-A_QTY',
+    'D1.3:A_TRICYCLE', 'D1.3-A_QTY', 'D1.4:A_CAR', 'D1.4-A_QTY',
+    'D1.5:A_JEEP', 'D1.5-A_QTY', 'D1.6:A_TRUCK', 'D1.6-A_QTY',
+    'D1.7:A_OTHERS', 'D1.7-A_QTY', 'D2.1:A_TV', 'D2.1-A_QTY',
+    'D2.2:A_DVD', 'D2.2-A_QTY', 'D2.3:A_WASH-M', 'D2.3-A_QTY',
+    'D2.4:A_AC', 'D2.4-A_QTY', 'D2.5:A_E-FAN', 'D2.5-A_QTY',
+    'D2.6:A_FRIDGE', 'D2.6-A_QTY', 'D2.7:A_STOVE', 'D2.7-A_QTY',
+    'D2.8:A_E-HEATER', 'D2.8-A_QTY', 'D2.9:A_FURNITURE', 'D2.9-A_QTY',
+    'D2.10:A_OTHERS', 'D2.10-A_QTY', 'D3.1:A_CP', 'D3.1-A_QTY',
+    'D3.2:A_LANDLINE', 'D3.2-A_QTY', 'D3.3:A_COMPUTER', 'D3.3-A_QTY',
+    'D3.4:A_OTHERS', 'D3.4-A_QTY', 'E1:A_DRINK-H2O', 'E2:A_DOMESTIC-H2O',
+    'E3:A_POWER-SUP', 'E4:A_COOK-FUEL', 'E5:A_NET-SUBS', 'F1:A_HOUSE-OWN',
+    'F2:A_HOUSE-ACQ', 'F3:A_HOUSE-BUILT', 'F4:A_OTHER-RP', 'G1:A_SSS',
+    'G2:A_GSIS', 'G3:A_PhilHealth', 'G4:A_PN-IN', 'G5:A_LIFE-IN', 'G6:A_HEALTH-IN'
 ]
+CORE_FEATURE_COUNT = 30
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-df = pd.read_csv(os.path.join(BASE_DIR, 'bfar.csv'))
-df['treatment'] = df['Y_BOAT-RE'].notna().astype(int)
+MODELS_DIR = os.path.join(BASE_DIR, 'models')
 
-X = df[pre_features]
-y = df['treatment']
 
-gb = GradientBoostingClassifier(n_estimators=100, learning_rate=0.1, max_depth=3, random_state=42)
-gb.fit(X, y)
+def _feature_importance_proxy(X, y):
+    """Neural Network has no feature_importances_ -- rank with a throwaway
+    Gradient Boosting fit instead, same proxy the notebooks use."""
+    proxy = GradientBoostingClassifier(n_estimators=100, learning_rate=0.1, max_depth=3, random_state=42)
+    proxy.fit(X, y)
+    return proxy.feature_importances_
 
-models_dir = os.path.join(BASE_DIR, 'models')
-os.makedirs(models_dir, exist_ok=True)
-joblib.dump(gb, os.path.join(models_dir, 'gradient_boosting_ps_model.pkl'))
 
-with open(os.path.join(models_dir, 'pre_features.json'), 'w') as f:
-    json.dump(pre_features, f)
+def main():
+    df = pd.read_csv(os.path.join(BASE_DIR, 'bfar.csv'))
+    if 'treatment' not in df.columns:
+        df['treatment'] = df['Y_BOAT-RE'].notna().astype(int)
 
-print("Model and features saved successfully.")
+    missing = [f for f in ALL_FEATURES if f not in df.columns]
+    if missing:
+        raise ValueError(f"bfar.csv is missing expected baseline features: {missing}")
+
+    X = core.impute_dataframe(df, ALL_FEATURES)[ALL_FEATURES]
+    y = df['treatment']
+
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+
+    candidates = {
+        'Logistic Regression': LogisticRegression(max_iter=1000, random_state=42),
+        'Random Forest': RandomForestClassifier(n_estimators=100, max_depth=5, random_state=42),
+        'Gradient Boosting': GradientBoostingClassifier(n_estimators=100, learning_rate=0.1, max_depth=3, random_state=42),
+        'Neural Network': MLPClassifier(hidden_layer_sizes=(100, 50), activation='relu', solver='adam',
+                                         max_iter=500, random_state=42, early_stopping=True, validation_fraction=0.1),
+    }
+    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+
+    print("=== Model selection on bfar.csv (5-fold CV) ===")
+    scored = {}
+    for name, model in candidates.items():
+        X_cv = X_scaled if name == 'Neural Network' else X
+        y_pred = cross_val_predict(model, X_cv, y, cv=cv, method='predict_proba')[:, 1]
+        mse = mean_squared_error(y, y_pred)
+        scored[name] = {
+            'mse': mse,
+            'rmse': np.sqrt(mse),
+            'mae': mean_absolute_error(y, y_pred),
+            'auc': roc_auc_score(y, y_pred),
+            'brier': brier_score_loss(y, y_pred),
+        }
+        print(f"  {name}: MSE={mse:.6f} RMSE={scored[name]['rmse']:.6f} "
+              f"MAE={scored[name]['mae']:.6f} AUC={scored[name]['auc']:.6f} Brier={scored[name]['brier']:.6f}")
+
+    best_name = min(scored, key=lambda n: scored[n]['mse'])
+    print(f"\nBest model (lowest MSE): {best_name}")
+    for metric, val in scored[best_name].items():
+        print(f"  {metric}: {val:.6f}")
+
+    best_model = candidates[best_name]
+    if best_name == 'Neural Network':
+        best_model.fit(X_scaled, y)
+        importances = _feature_importance_proxy(X, y)
+    else:
+        best_model.fit(X, y)
+        importances = (
+            best_model.feature_importances_ if hasattr(best_model, 'feature_importances_')
+            else np.abs(best_model.coef_[0])
+        )
+
+    ranked = pd.Series(importances, index=ALL_FEATURES).sort_values(ascending=False)
+    core_features = ranked.index[:CORE_FEATURE_COUNT].tolist()
+    remaining_features = ranked.index[CORE_FEATURE_COUNT:].tolist()
+
+    print(f"\nTop {CORE_FEATURE_COUNT} core features:")
+    print(core_features)
+    print(f"\nRemaining {len(remaining_features)} features:")
+    print(remaining_features)
+
+    os.makedirs(MODELS_DIR, exist_ok=True)
+    joblib.dump(best_model, os.path.join(MODELS_DIR, 'best_model.pkl'))
+    joblib.dump(scaler, os.path.join(MODELS_DIR, 'scaler.pkl'))
+    for fname, values in (
+        ('all_features.json', ALL_FEATURES),
+        ('core_features.json', core_features),
+        ('remaining_features.json', remaining_features),
+    ):
+        with open(os.path.join(MODELS_DIR, fname), 'w') as f:
+            json.dump(values, f, indent=2)
+
+    print(f"\nSaved baseline artifacts to {MODELS_DIR}{os.sep} "
+          f"(best_model.pkl, scaler.pkl, all_features.json, core_features.json, remaining_features.json)")
+
+
+if __name__ == '__main__':
+    main()
