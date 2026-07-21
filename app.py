@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 from dotenv import load_dotenv
 import os
@@ -139,6 +139,14 @@ def _no_model_error(df):
     n_covered = len(set(df.columns) & set(ALL_FEATURES)) if ALL_FEATURES else 0
     return (f"no dynamic model trained yet, and this dataset covers only {n_covered}/{total} baseline "
             f"features -- POST a CSV to /train first, or include all {total} baseline features")
+
+
+@app.route("/", methods=["GET"])
+def test_ui():
+    """Manual smoke-test page for POST /train and POST /predict_ps_batch --
+    not part of the production integration path (see README's integration
+    guide), just a way to drive an upload through a browser instead of curl."""
+    return send_from_directory(os.path.dirname(os.path.abspath(__file__)), "test_ui.html")
 
 
 @app.route("/train", methods=["POST"])
