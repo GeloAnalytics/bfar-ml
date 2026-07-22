@@ -1,12 +1,15 @@
 # ML Flask Service (Propensity Score Matching)
 
-A single Flask service (`app.py`, shared logic in `psm_core.py`) serving two models
-side by side:
+A single file, `app.py` (shared logic in `psm_core.py`), running two Flask apps as two
+independent servers on two ports -- the dynamic app runs in the main thread, the static
+app in a background thread, started together by `python app.py`:
 
-| | Baseline | Dynamic |
+| | Static | Dynamic |
 |---|---|---|
-| **Trigger** | Request covers all 57 raw bfar.csv columns | Anything else |
-| **Model** | `models/best_model.pkl` -- frozen, produced by `build_model.py` | Whatever `POST /train` last produced |
+| **Port** | `STATIC_PORT` (default `8001`) | `PORT` (default `8000`) |
+| **Trigger** | Every request | Request covers all 57 raw bfar.csv columns falls back to baseline; anything else uses the trained dynamic model |
+| **Model** | `models/best_model.pkl` -- frozen, produced by `build_model.py` | Baseline (see left) or whatever `POST /train` last produced |
+| **`/train` endpoint?** | No -- baseline-only, rejects requests missing any of the 57 features (`409`) | Yes |
 | **Retrained on upload?** | Never | Every `/train` call, unconditionally |
 | **Persisted?** | Yes, committed to the repo | Yes, `models/dynamic/` (gitignored runtime state) |
 
@@ -15,6 +18,10 @@ whatever model is currently active and trains a completely fresh one on the new
 upload -- ranking every usable column by feature importance and keeping the top 30, no
 merging with the previous schema, no reuse-shortcut. See `DYNAMIC_TRAINING.md` for the
 full design and why this replaced an earlier index-mapping approach.
+
+Both always start together (one process, `python app.py`) -- there's no flag to run
+just one, but each is an independent Flask server on its own port, so callers only
+ever need to know about whichever one they integrate against.
 
 If this repo is dropped into another project as a subfolder (commonly named `ml/`), prefix the commands below with that folder (e.g. `pip install -r ml/requirements.txt`, `python ml/app.py`). All paths resolve relative to each file's own location -- `bfar.csv` just needs to stay next to `build_model.py`.
 
@@ -27,13 +34,17 @@ server-to-server, not something a frontend talks to directly in production. It b
 public internet as-is.
 
 ```
-frontend  -->  your backend  -->  app.py (HOST:PORT from .env, default 0.0.0.0:8000)
+                    -->  app.py, dynamic app   (HOST:PORT from .env, default 0.0.0.0:8000)
+frontend  -->  your backend
+                    -->  app.py, static app     (STATIC_HOST:STATIC_PORT, default 0.0.0.0:8001)
 ```
 
 **Configuration (`.env`).** Loaded on startup via `python-dotenv`:
 ```bash
 HOST=0.0.0.0
 PORT=8000
+STATIC_HOST=0.0.0.0
+STATIC_PORT=8001
 # ML_MODEL_DIR=models             # only if baseline artifacts live somewhere other than ./models
 # ML_DYNAMIC_STATE_DIR=models/dynamic  # only if the trained dynamic model should live elsewhere
 ```
@@ -48,7 +59,7 @@ PORT=8000
 frontend ever calls this service directly, restrict it first
 (`CORS(app, origins=["https://your-frontend"])`).
 
-**Quick endpoint reference:**
+**Quick endpoint reference** (dynamic service, `app.py`, port `8000`):
 
 | Method & path | Body | Returns |
 |---|---|---|
@@ -58,15 +69,23 @@ frontend ever calls this service directly, restrict it first
 | `POST /estimate_att` | JSON `{records}` with `treatment`+`outcome` per record | matched-ATT result |
 | `POST /predict_ps_batch` | multipart CSV (`file`) | per-row `ps` + decision-support quartile table |
 
+The static app (port `8001`, same `app.py` process) exposes the same `GET /health`,
+`POST /predict_ps`, `POST /estimate_att`, and `POST /predict_ps_batch` -- no `/train`.
+Every request must cover all 57 baseline features or it gets a `409`; `source` in the
+response is always `"baseline"`.
+
 **Response fields:** all three scoring endpoints report `source` (`"baseline"` or
 `"dynamic"`, telling you which model actually served the request) and
 `n_features_used`.
 
 **Running in production.** `app.run(...)` is Flask's dev server -- put a real WSGI
-server in front:
+server in front. `app.py` exposes two module-level Flask objects, `app` (dynamic) and
+`static_app` (static), so a WSGI server can target either directly instead of going
+through the `if __name__ == "__main__"` thread-starting block:
 ```bash
 pip install waitress   # Windows-friendly; use gunicorn on Linux
 waitress-serve --host=0.0.0.0 --port=8000 app:app
+waitress-serve --host=0.0.0.0 --port=8001 app:static_app
 ```
 Note: the dynamic model is in-process state mirrored to disk. If you scale to
 multiple workers, they won't share a freshly `/train`-ed model until each has
@@ -93,7 +112,9 @@ the winner as the frozen baseline.
 ```bash
 python app.py
 ```
-Reads `HOST`/`PORT` from `.env` (defaults `0.0.0.0:8000`).
+Starts both servers in one process: the dynamic app on `HOST`/`PORT` (default
+`0.0.0.0:8000`, main thread) and the static baseline-only app on `STATIC_HOST`/
+`STATIC_PORT` (default `0.0.0.0:8001`, background thread).
 
 ## 3) Endpoints
 

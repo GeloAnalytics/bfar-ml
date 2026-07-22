@@ -3,6 +3,7 @@ from flask_cors import CORS
 from dotenv import load_dotenv
 import os
 import json
+import threading
 import time
 
 import joblib
@@ -13,13 +14,25 @@ import psm_core as core
 
 load_dotenv()
 
+# ---------------------------------------------------------------------------
+# Two Flask apps, one process: `app` (dynamic, PORT/HOST) keeps the existing
+# auto-detect-baseline-vs-adaptive behavior plus POST /train, unchanged.
+# `static_app` (STATIC_PORT/STATIC_HOST) is a second, independent server that
+# only ever serves the frozen bfar.csv baseline -- no /train, no dynamic
+# fallback, 409 if a request doesn't cover all 57 baseline features. Both are
+# started at the bottom of this file, each on its own port/thread.
+# ---------------------------------------------------------------------------
 app = Flask(__name__)
 CORS(app)
+
+static_app = Flask(__name__)
+CORS(static_app)
 
 # ---------------------------------------------------------------------------
 # Frozen bfar.csv baseline -- produced once by build_model.py, never
 # retrained or overwritten by this service. Requests covering all 57 raw
-# baseline features score against it directly (no fitting).
+# baseline features score against it directly (no fitting). Shared by both
+# apps above.
 # ---------------------------------------------------------------------------
 MODEL_DIR = os.environ.get("ML_MODEL_DIR", os.path.join(os.path.dirname(__file__), "models"))
 MODEL_PATH = os.path.join(MODEL_DIR, "best_model.pkl")
@@ -63,7 +76,8 @@ except Exception as e:
 # Dynamic model -- trained from whatever CSV was last POSTed to /train,
 # persisted so it survives a restart. Teachable-Machine style: every /train
 # call deletes whatever was active and fits a completely fresh model on the
-# new upload. No merging with the previous schema, no reuse-shortcut.
+# new upload. No merging with the previous schema, no reuse-shortcut. Only
+# `app` (the dynamic service) uses this -- `static_app` never trains.
 # ---------------------------------------------------------------------------
 STATE_DIR = os.environ.get("ML_DYNAMIC_STATE_DIR", os.path.join(os.path.dirname(__file__), "models", "dynamic"))
 STATE_MODEL_PATH = os.path.join(STATE_DIR, "model.pkl")
@@ -140,6 +154,34 @@ def _no_model_error(df):
     return (f"no dynamic model trained yet, and this dataset covers only {n_covered}/{total} baseline "
             f"features -- POST a CSV to /train first, or include all {total} baseline features")
 
+
+def _missing_features_error(df):
+    missing = [f for f in ALL_FEATURES if f not in df.columns]
+    return (f"this port serves only the frozen baseline and requires all {len(ALL_FEATURES)} "
+            f"features; missing: {missing[:5]}{'...' if len(missing) > 5 else ''}")
+
+
+def _decision_support_payload(df, ps):
+    ps_logit = core.logit(ps)
+    key_features = [f for f in KEY_SUPPORT_FEATURES if f in df.columns]
+    support_input = df[key_features].copy() if key_features else pd.DataFrame(index=df.index)
+    support_input["ps"] = ps
+    support_table = core.decision_support_table(support_input, key_features=key_features, ps_col="ps")
+
+    decision_support = []
+    for _, row in support_table.iterrows():
+        rec = {"ps_group": str(row["ps_group"]), "count": int(row["Count"]), "interpretation": row["Interpretation"]}
+        for col in support_table.columns:
+            if col.startswith("Mean_"):
+                rec[col.lower()] = core.json_safe_float(row[col])
+        decision_support.append(rec)
+
+    return ps_logit, decision_support
+
+
+# ===========================================================================
+# `app` -- dynamic service (auto-detect baseline-vs-adaptive, POST /train)
+# ===========================================================================
 
 @app.route("/", methods=["GET"])
 def test_ui():
@@ -332,20 +374,7 @@ def predict_ps_batch():
         return jsonify({"error": f"CSV missing required features: {missing[:5]}{'...' if len(missing) > 5 else ''}"}), 400
 
     ps, _X = _score(source, model, feature_cols, scaler, df)
-    ps_logit = core.logit(ps)
-
-    key_features = [f for f in KEY_SUPPORT_FEATURES if f in df.columns]
-    support_input = df[key_features].copy() if key_features else pd.DataFrame(index=df.index)
-    support_input["ps"] = ps
-    support_table = core.decision_support_table(support_input, key_features=key_features, ps_col="ps")
-
-    decision_support = []
-    for _, row in support_table.iterrows():
-        rec = {"ps_group": str(row["ps_group"]), "count": int(row["Count"]), "interpretation": row["Interpretation"]}
-        for col in support_table.columns:
-            if col.startswith("Mean_"):
-                rec[col.lower()] = core.json_safe_float(row[col])
-        decision_support.append(rec)
+    ps_logit, decision_support = _decision_support_payload(df, ps)
 
     return jsonify({
         "rows": len(df),
@@ -402,7 +431,165 @@ def health():
     return jsonify(response)
 
 
+# ===========================================================================
+# `static_app` -- baseline-only service, no /train, no dynamic fallback
+# ===========================================================================
+
+@static_app.route("/predict_ps", methods=["POST"])
+def static_predict_ps():
+    """
+    JSON body: { "records": [ { "<column_name>": value, ... }, ... ] }
+
+    Scores against the frozen bfar.csv baseline. Every record must cover all
+    57 raw baseline features -- this service never trains or adapts.
+    """
+    if BASELINE_MODEL is None:
+        return jsonify({"error": f"ML artifacts not loaded: {ARTIFACT_LOAD_ERROR}"}), 500
+
+    body = request.get_json(force=True, silent=True) or {}
+    records = body.get("records")
+    if not isinstance(records, list) or len(records) == 0:
+        return jsonify({"error": "records must be a non-empty array"}), 400
+    df = pd.DataFrame(records)
+
+    if not all(f in df.columns for f in ALL_FEATURES):
+        return jsonify({"error": _missing_features_error(df)}), 409
+
+    ps, _X = _score("baseline", BASELINE_MODEL, ALL_FEATURES, BASELINE_SCALER, df)
+    return jsonify({
+        "ps_final": [core.json_safe_float(v) for v in ps],
+        "source": "baseline",
+        "n_features_used": len(ALL_FEATURES),
+    })
+
+
+@static_app.route("/estimate_att", methods=["POST"])
+def static_estimate_att():
+    """
+    JSON body:
+    {
+      "records": [ { "<column_name>": value, ..., "treatment": 0/1, "outcome": number }, ... ],
+      "treatmentKey": "treatment", "outcomeKey": "outcome",  # optional
+      "caliper_ratio": 0.2, "n_bootstrap": 500, "seed": 42   # optional
+    }
+    """
+    if BASELINE_MODEL is None:
+        return jsonify({"error": f"ML artifacts not loaded: {ARTIFACT_LOAD_ERROR}"}), 500
+
+    body = request.get_json(force=True, silent=True) or {}
+    records = body.get("records")
+    if not isinstance(records, list) or len(records) == 0:
+        return jsonify({"error": "records must be a non-empty array"}), 400
+    df = pd.DataFrame(records)
+
+    treatment_key = body.get("treatmentKey", "treatment")
+    outcome_key = body.get("outcomeKey", "outcome")
+    if treatment_key not in df.columns:
+        return jsonify({"error": f"missing required field: {treatment_key}"}), 400
+    if outcome_key not in df.columns:
+        return jsonify({"error": f"missing required field: {outcome_key}"}), 400
+
+    if not all(f in df.columns for f in ALL_FEATURES):
+        return jsonify({"error": _missing_features_error(df)}), 409
+
+    ps, _X = _score("baseline", BASELINE_MODEL, ALL_FEATURES, BASELINE_SCALER, df)
+    ps_logit = core.logit(ps)
+    treatments = df[treatment_key].astype(int).to_numpy()
+    outcomes = pd.to_numeric(df[outcome_key], errors="coerce").to_numpy(dtype=float)
+
+    result, err = core.matched_att(
+        ps_logit, treatments, outcomes,
+        caliper_ratio=float(body.get("caliper_ratio", 0.2)),
+        n_bootstrap=int(body.get("n_bootstrap", 500)),
+        seed=int(body.get("seed", 42)),
+    )
+    if err:
+        return jsonify({"error": err}), 400
+
+    result["source"] = "baseline"
+    result["n_features_used"] = len(ALL_FEATURES)
+    return jsonify(result)
+
+
+@static_app.route("/predict_ps_batch", methods=["POST"])
+def static_predict_ps_batch():
+    """
+    multipart/form-data: file: <CSV file>   required
+
+    Whole-dataset counterpart to /predict_ps: scores every row against the
+    frozen baseline and returns a decision-support table stratified by
+    propensity-score quartile, alongside the raw per-row scores.
+    """
+    if BASELINE_MODEL is None:
+        return jsonify({"error": f"ML artifacts not loaded: {ARTIFACT_LOAD_ERROR}"}), 500
+
+    file = request.files.get("file")
+    if file is None:
+        return jsonify({"error": "multipart form field 'file' (CSV) is required"}), 400
+
+    try:
+        df = pd.read_csv(file)
+    except Exception as e:
+        return jsonify({"error": f"could not parse CSV: {e}"}), 400
+    if len(df) == 0:
+        return jsonify({"error": "uploaded CSV has no rows"}), 400
+
+    if not all(f in df.columns for f in ALL_FEATURES):
+        return jsonify({"error": _missing_features_error(df)}), 409
+
+    ps, _X = _score("baseline", BASELINE_MODEL, ALL_FEATURES, BASELINE_SCALER, df)
+    ps_logit, decision_support = _decision_support_payload(df, ps)
+
+    return jsonify({
+        "rows": len(df),
+        "source": "baseline",
+        "n_features_used": len(ALL_FEATURES),
+        "ps": [core.json_safe_float(v) for v in ps],
+        "ps_logit": [core.json_safe_float(v) for v in ps_logit],
+        "ps_summary": {
+            "min": core.json_safe_float(np.min(ps)),
+            "max": core.json_safe_float(np.max(ps)),
+            "mean": core.json_safe_float(np.mean(ps)),
+            "median": core.json_safe_float(np.median(ps)),
+        },
+        "decision_support": decision_support,
+    })
+
+
+@static_app.route("/health", methods=["GET"])
+def static_health():
+    if BASELINE_MODEL is None:
+        return jsonify({
+            "status": "degraded",
+            "artifact_error": ARTIFACT_LOAD_ERROR,
+            "model_dir": MODEL_DIR,
+        }), 500
+
+    response = {
+        "status": "ok",
+        "model_dir": MODEL_DIR,
+        "baseline": {
+            "source": "bfar.csv (baked-in, static, never retrained)",
+            "model_type": type(BASELINE_MODEL).__name__,
+            "n_features_total": len(ALL_FEATURES),
+        },
+    }
+    if BASELINE_IMPORTANCES is not None:
+        top_features = sorted(BASELINE_IMPORTANCES.items(), key=lambda kv: kv[1], reverse=True)[:30]
+        response["baseline"]["top_features"] = [{"feature": name, "importance": imp} for name, imp in top_features]
+    return jsonify(response)
+
+
 if __name__ == "__main__":
     host = os.environ.get("HOST", "0.0.0.0")
     port = int(os.environ.get("PORT", "8000"))
+    static_host = os.environ.get("STATIC_HOST", os.environ.get("HOST", "0.0.0.0"))
+    static_port = int(os.environ.get("STATIC_PORT", "8001"))
+
+    static_thread = threading.Thread(
+        target=lambda: static_app.run(host=static_host, port=static_port, debug=False, use_reloader=False),
+        daemon=True,
+    )
+    static_thread.start()
+
     app.run(host=host, port=port, debug=False)
