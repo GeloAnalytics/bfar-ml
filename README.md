@@ -1,20 +1,37 @@
 # ML Flask Service (Propensity Score Matching)
 
-A single Flask service (`app.py`, shared logic in `psm_core.py`) serving two models
-side by side:
+A single file, `app.py` (shared logic in `psm_core.py`), running two Flask apps as two
+independent servers on two ports -- the dynamic app runs in the main thread, the static
+app in a background thread, started together by `python app.py`:
 
-| | Baseline | Dynamic |
+| | Static | Dynamic |
 |---|---|---|
-| **Trigger** | Request covers all 57 raw bfar.csv columns | Anything else |
-| **Model** | `models/best_model.pkl` -- frozen, produced by `build_model.py` | Whatever `POST /train` last produced |
-| **Retrained on upload?** | Never | Every `/train` call, unconditionally |
+| **Port** | `STATIC_PORT` (default `8001`) | `PORT` (default `8000`) |
+| **Trigger** | Every request | Request covers all 57 raw bfar.csv columns falls back to baseline; anything else uses the trained dynamic model |
+| **Model** | `models/best_model.pkl` -- frozen, produced by `build_model.py` | Baseline (see left) or whatever `POST /train` last produced |
+| **`/train` endpoint?** | No -- baseline-only, rejects requests missing any of the 57 features (`409`) | Yes |
+| **Retrained on upload?** | Never | Every `/train` call, *unless* the upload's column set exactly matches whatever last trained the active model (see below) |
 | **Persisted?** | Yes, committed to the repo | Yes, `models/dynamic/` (gitignored runtime state) |
 
-The dynamic model works **Teachable-Machine style**: every `POST /train` call deletes
-whatever model is currently active and trains a completely fresh one on the new
-upload -- ranking every usable column by feature importance and keeping the top 30, no
-merging with the previous schema, no reuse-shortcut. See `DYNAMIC_TRAINING.md` for the
-full design and why this replaced an earlier index-mapping approach.
+The dynamic model works **Teachable-Machine style**: every `POST /train` call with a
+new column set deletes whatever model is currently active and trains a completely
+fresh one on the new upload -- ranking every usable column by feature importance and
+fitting on all of them, no top-N cap and no merging with the previous schema. The full
+ranking ships in the response (`feature_selection.selected`); curating that list down
+further is left to the integrator, not this service. If the uploaded CSV's columns
+exactly match the columns of whatever dataset trained the currently active model,
+training is skipped entirely and the existing model is reused as-is (`retrained: false`
+in the response) -- only re-scored against the new upload. See `DYNAMIC_TRAINING.md`
+for the full design and why this replaced an earlier index-mapping approach.
+
+If covariate balance isn't achieved after fitting (mean |SMD| across matched pairs
+`>= 0.1`), `/train` automatically drops the single worst-balanced feature and retries,
+up to 3 attempts, before finalizing -- see `covariate_balance` in the response and
+`psm_core.covariate_balance`.
+
+Both always start together (one process, `python app.py`) -- there's no flag to run
+just one, but each is an independent Flask server on its own port, so callers only
+ever need to know about whichever one they integrate against.
 
 If this repo is dropped into another project as a subfolder (commonly named `ml/`), prefix the commands below with that folder (e.g. `pip install -r ml/requirements.txt`, `python ml/app.py`). All paths resolve relative to each file's own location -- `bfar.csv` just needs to stay next to `build_model.py`.
 
@@ -27,13 +44,17 @@ server-to-server, not something a frontend talks to directly in production. It b
 public internet as-is.
 
 ```
-frontend  -->  your backend  -->  app.py (HOST:PORT from .env, default 0.0.0.0:8000)
+                    -->  app.py, dynamic app   (HOST:PORT from .env, default 0.0.0.0:8000)
+frontend  -->  your backend
+                    -->  app.py, static app     (STATIC_HOST:STATIC_PORT, default 0.0.0.0:8001)
 ```
 
 **Configuration (`.env`).** Loaded on startup via `python-dotenv`:
 ```bash
 HOST=0.0.0.0
 PORT=8000
+STATIC_HOST=0.0.0.0
+STATIC_PORT=8001
 # ML_MODEL_DIR=models             # only if baseline artifacts live somewhere other than ./models
 # ML_DYNAMIC_STATE_DIR=models/dynamic  # only if the trained dynamic model should live elsewhere
 ```
@@ -48,25 +69,33 @@ PORT=8000
 frontend ever calls this service directly, restrict it first
 (`CORS(app, origins=["https://your-frontend"])`).
 
-**Quick endpoint reference:**
+**Quick endpoint reference** (dynamic service, `app.py`, port `8000`):
 
 | Method & path | Body | Returns |
 |---|---|---|
 | `GET /health` | -- | baseline status + current dynamic model status |
-| `POST /train` | multipart CSV (`file`, `treatment_column?`) | trained model summary; **replaces** whatever was previously active |
-| `POST /predict_ps` | JSON `{records}` | `{ps_final, source, n_features_used}` |
-| `POST /estimate_att` | JSON `{records}` with `treatment`+`outcome` per record | matched-ATT result |
-| `POST /predict_ps_batch` | multipart CSV (`file`) | per-row `ps` + decision-support quartile table |
+| `POST /train` | multipart CSV (`file`, `treatment_column?`) | trained (or reused, see above) model summary + `ps_output`/`covariate_balance`/`model_interpretation`/`decision_support` |
+| `POST /train/predict_ps` | JSON `{records}` | `{ps_final, source, n_features_used}` |
+| `POST /train/estimate_att` | JSON `{records}` with `treatment`+`outcome` per record | matched-ATT result |
+| `POST /train/predict_ps_batch` | multipart CSV (`file`) | per-row `ps` + decision-support quartile table |
+
+The static app (port `8001`, same `app.py` process) exposes the same `GET /health`,
+plus `POST /predict_ps`, `POST /estimate_att`, and `POST /predict_ps_batch` **without**
+the `/train` prefix -- no `/train` endpoint at all. Every request must cover all 57
+baseline features or it gets a `409`; `source` in the response is always `"baseline"`.
 
 **Response fields:** all three scoring endpoints report `source` (`"baseline"` or
 `"dynamic"`, telling you which model actually served the request) and
 `n_features_used`.
 
 **Running in production.** `app.run(...)` is Flask's dev server -- put a real WSGI
-server in front:
+server in front. `app.py` exposes two module-level Flask objects, `app` (dynamic) and
+`static_app` (static), so a WSGI server can target either directly instead of going
+through the `if __name__ == "__main__"` thread-starting block:
 ```bash
 pip install waitress   # Windows-friendly; use gunicorn on Linux
 waitress-serve --host=0.0.0.0 --port=8000 app:app
+waitress-serve --host=0.0.0.0 --port=8001 app:static_app
 ```
 Note: the dynamic model is in-process state mirrored to disk. If you scale to
 multiple workers, they won't share a freshly `/train`-ed model until each has
@@ -93,7 +122,9 @@ the winner as the frozen baseline.
 ```bash
 python app.py
 ```
-Reads `HOST`/`PORT` from `.env` (defaults `0.0.0.0:8000`).
+Starts both servers in one process: the dynamic app on `HOST`/`PORT` (default
+`0.0.0.0:8000`, main thread) and the static baseline-only app on `STATIC_HOST`/
+`STATIC_PORT` (default `0.0.0.0:8001`, background thread).
 
 ## 3) Endpoints
 
@@ -124,7 +155,7 @@ After a `/train` call, `dynamic` instead looks like:
   "trained_at": 1752566400.0,
   "treatment_column": "enrolled",
   "treatment_detection_method": "binary_value",
-  "n_features_selected": 30,
+  "n_features_selected": 27,
   "top_features": [{"feature": "monthly_income", "importance": 0.11}, "..."]
 }
 ```
@@ -135,30 +166,70 @@ curl -X POST http://localhost:8000/train -F "file=@mydataset.csv"
 ```
 Optional form field: `treatment_column=enrolled_flag` (bypasses auto-detection).
 
-**Deletes whatever dynamic model is currently active and trains a completely fresh
-one** -- ranks every usable numeric column by importance for predicting the detected
-treatment column (excluding near-perfect treatment proxies), keeps the top 30, fits a
-fresh model. Nothing carries over from any previous `/train` call.
+**If the uploaded CSV's column set exactly matches the columns that trained the
+currently active model, retraining is skipped** (`retrained: false`) and that model is
+just re-scored against this upload. Otherwise it deletes whatever dynamic model is
+currently active and trains a completely fresh one -- ranks every usable numeric
+column by importance for predicting the detected treatment column (excluding
+near-perfect treatment proxies), then fits on **all** of them -- no top-N cap; the full
+ranking ships back in `feature_selection.selected` and it's on the integrator to
+curate that list further if they want a smaller feature set. If covariate balance
+isn't achieved, drops the single worst-balanced feature and retries (up to 3 attempts
+total, see `retrain_attempts`). Nothing carries over from any previous `/train` call
+that actually retrained.
 ```json
 {
   "status": "trained",
+  "retrained": true,
+  "retrain_attempts": 1,
   "rows": 412,
   "treatment_column": "enrolled",
   "treatment_detection_method": "binary_value",
-  "n_features_selected": 30,
-  "top_features": [{"feature": "monthly_income", "importance": 0.11}, "..."],
-  "excluded_as_leakage": ["group_assignment_code"]
+  "feature_selection": {
+    "n_features_selected": 27,
+    "selected": [{"feature": "monthly_income", "importance": 0.11}, "..."],
+    "excluded_as_leakage": ["group_assignment_code"],
+    "dropped_for_rebalancing": []
+  },
+  "ps_output": {
+    "ps": [0.42, "..."],
+    "ps_logit": [-0.32, "..."],
+    "ps_summary": {"min": 0.03, "max": 0.97, "mean": 0.51, "median": 0.49}
+  },
+  "covariate_balance": {
+    "balance_achieved": true,
+    "mean_abs_smd": 0.061,
+    "balance_threshold": 0.1,
+    "matched_pairs": 180,
+    "caliper": 0.24,
+    "overlap": {"treated_in_control_range_pct": 96.1, "control_in_treated_range_pct": 91.4},
+    "per_feature": [{"feature": "monthly_income", "smd_before": 0.34, "smd_after": 0.05}, "..."],
+    "worst_feature": "household_size"
+  },
+  "model_interpretation": {
+    "method": "GradientBoostingClassifier.feature_importances_ (not SHAP)",
+    "feature_contributions": [{"feature": "monthly_income", "importance": 0.11}, "..."]
+  },
+  "decision_support": [{"ps_group": "Low", "count": 103, "interpretation": "Very low likelihood - may need targeted outreach"}, "..."]
 }
 ```
+`covariate_balance` (pipeline step 7) reports standardized mean difference per feature
+before/after 1-NN caliper matching, propensity-score common-support overlap between
+groups, and a `balance_achieved` verdict (mean |SMD after matching| `< 0.1`) --
+`psm_core.covariate_balance`. `model_interpretation` (step 9) is the same
+`feature_importances_` used for selection, explicitly labeled as not being true SHAP
+(no `shap` dependency is installed). `decision_support` (step 10) is the same
+PS-quartile table `/train/predict_ps_batch` returns, computed in-sample on the
+training upload itself.
 
 ### Predict propensity scores (JSON records)
 ```bash
-curl -X POST http://localhost:8000/predict_ps \
+curl -X POST http://localhost:8000/train/predict_ps \
   -H "Content-Type: application/json" \
   -d '{ "records": [ { "monthly_income": 8000, "household_size": 4, "...": 0 } ] }'
 ```
 ```json
-{ "ps_final": [0.42], "source": "dynamic", "n_features_used": 30 }
+{ "ps_final": [0.42], "source": "dynamic", "n_features_used": 27 }
 ```
 Scores against the frozen baseline (`source: "baseline"`) if every record covers all
 57 raw bfar features; otherwise against whatever's currently in the dynamic model
@@ -167,7 +238,7 @@ baseline features.
 
 ### Predict propensity scores + decision support (whole CSV)
 ```bash
-curl -X POST http://localhost:8000/predict_ps_batch -F "file=@mydataset.csv"
+curl -X POST http://localhost:8000/train/predict_ps_batch -F "file=@mydataset.csv"
 ```
 Scores every row and adds a decision-support table stratified by propensity-score
 quartile (Low / Med-Low / Med-High / High) with per-group interpretations, plus
@@ -176,7 +247,7 @@ predict-and-support workflow.
 
 ### Estimate ATT via matching (JSON records)
 ```bash
-curl -X POST http://localhost:8000/estimate_att \
+curl -X POST http://localhost:8000/train/estimate_att \
   -H "Content-Type: application/json" \
   -d '{
     "records": [

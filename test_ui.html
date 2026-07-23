@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>BFAR ML -- Dynamic Training Test UI</title>
+<style>
+  :root { color-scheme: light dark; }
+  body {
+    font-family: -apple-system, Segoe UI, Roboto, sans-serif;
+    max-width: 860px;
+    margin: 2rem auto;
+    padding: 0 1rem;
+    line-height: 1.5;
+  }
+  h1 { font-size: 1.4rem; }
+  h2 { font-size: 1.1rem; margin-top: 2.5rem; border-bottom: 1px solid #8884; padding-bottom: 0.3rem; }
+  .card {
+    border: 1px solid #8884;
+    border-radius: 8px;
+    padding: 1rem 1.25rem;
+    margin-top: 0.75rem;
+  }
+  label { display: block; font-weight: 600; margin-bottom: 0.25rem; font-size: 0.9rem; }
+  input[type="file"], input[type="text"] {
+    display: block;
+    margin-bottom: 0.75rem;
+    width: 100%;
+    box-sizing: border-box;
+  }
+  button {
+    background: #2563eb;
+    color: white;
+    border: none;
+    padding: 0.5rem 1.1rem;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 0.95rem;
+  }
+  button:disabled { background: #93a3b8; cursor: not-allowed; }
+  pre {
+    background: #0001;
+    padding: 0.75rem;
+    border-radius: 6px;
+    overflow-x: auto;
+    max-height: 360px;
+    font-size: 0.82rem;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  .status { font-size: 0.85rem; margin-top: 0.5rem; }
+  .status.ok { color: #16a34a; }
+  .status.err { color: #dc2626; }
+  .muted { color: #8884; }
+</style>
+</head>
+<body>
+
+<h1>BFAR ML &mdash; Dynamic Training Test UI</h1>
+<p class="muted">
+  Manual smoke-test harness for the "teachable machine" training flow:
+  upload a CSV, it gets sent to <code>POST /train</code>, which deletes
+  whatever dynamic model was active and fits a fresh one on this upload.
+  Not a production frontend -- see <code>README.md</code> for the integration guide.
+</p>
+
+<h2>Service status</h2>
+<div class="card">
+  <button id="refreshHealth">Refresh /health</button>
+  <pre id="healthOut">(not loaded yet)</pre>
+</div>
+
+<h2>1. Train on a new dataset</h2>
+<div class="card">
+  <label for="trainFile">CSV file</label>
+  <input type="file" id="trainFile" accept=".csv">
+  <label for="treatmentCol">Treatment column override (optional)</label>
+  <input type="text" id="treatmentCol" placeholder="leave blank to auto-detect">
+  <button id="trainBtn">Train</button>
+  <div id="trainStatus" class="status"></div>
+  <pre id="trainOut">(no response yet)</pre>
+</div>
+
+<h2>2. Score a dataset against the current model</h2>
+<div class="card">
+  <label for="scoreFile">CSV file</label>
+  <input type="file" id="scoreFile" accept=".csv">
+  <button id="scoreBtn">Score (predict_ps_batch)</button>
+  <div id="scoreStatus" class="status"></div>
+  <pre id="scoreOut">(no response yet)</pre>
+</div>
+
+<script>
+const API_BASE = ""; // same-origin: served by app.py itself
+
+async function loadHealth() {
+  const out = document.getElementById("healthOut");
+  out.textContent = "loading...";
+  try {
+    const res = await fetch(`${API_BASE}/health`);
+    const body = await res.json();
+    out.textContent = JSON.stringify(body, null, 2);
+  } catch (e) {
+    out.textContent = "Error: " + e.message;
+  }
+}
+
+document.getElementById("refreshHealth").addEventListener("click", loadHealth);
+loadHealth();
+
+document.getElementById("trainBtn").addEventListener("click", async () => {
+  const fileInput = document.getElementById("trainFile");
+  const status = document.getElementById("trainStatus");
+  const out = document.getElementById("trainOut");
+  const treatmentCol = document.getElementById("treatmentCol").value.trim();
+
+  if (!fileInput.files.length) {
+    status.textContent = "Pick a CSV file first.";
+    status.className = "status err";
+    return;
+  }
+
+  const form = new FormData();
+  form.append("file", fileInput.files[0]);
+  if (treatmentCol) form.append("treatment_column", treatmentCol);
+
+  status.textContent = "Training...";
+  status.className = "status";
+  out.textContent = "";
+
+  try {
+    const res = await fetch(`${API_BASE}/train`, { method: "POST", body: form });
+    const body = await res.json();
+    out.textContent = JSON.stringify(body, null, 2);
+    if (res.ok) {
+      status.textContent = `Trained on ${body.rows} rows -- treatment column "${body.treatment_column}" (${body.treatment_detection_method}), ${body.n_features_selected} features selected.`;
+      status.className = "status ok";
+      loadHealth();
+    } else {
+      status.textContent = `Error (${res.status}): ${body.error || "unknown"}`;
+      status.className = "status err";
+    }
+  } catch (e) {
+    status.textContent = "Request failed: " + e.message;
+    status.className = "status err";
+  }
+});
+
+document.getElementById("scoreBtn").addEventListener("click", async () => {
+  const fileInput = document.getElementById("scoreFile");
+  const status = document.getElementById("scoreStatus");
+  const out = document.getElementById("scoreOut");
+
+  if (!fileInput.files.length) {
+    status.textContent = "Pick a CSV file first.";
+    status.className = "status err";
+    return;
+  }
+
+  const form = new FormData();
+  form.append("file", fileInput.files[0]);
+
+  status.textContent = "Scoring...";
+  status.className = "status";
+  out.textContent = "";
+
+  try {
+    const res = await fetch(`${API_BASE}/train/predict_ps_batch`, { method: "POST", body: form });
+    const body = await res.json();
+    out.textContent = JSON.stringify(body, null, 2);
+    if (res.ok) {
+      status.textContent = `Scored ${body.rows} rows using the "${body.source}" model (${body.n_features_used} features).`;
+      status.className = "status ok";
+    } else {
+      status.textContent = `Error (${res.status}): ${body.error || "unknown"}`;
+      status.className = "status err";
+    }
+  } catch (e) {
+    status.textContent = "Request failed: " + e.message;
+    status.className = "status err";
+  }
+});
+</script>
+
+</body>
+</html>

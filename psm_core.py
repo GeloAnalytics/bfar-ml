@@ -201,8 +201,8 @@ def _leakage_correlated_columns(df, treatment_col, treatment_binarized, candidat
     return leaky
 
 
-def _rank_candidate_features(df, treatment_col, treatment_binarized):
-    candidate_cols = _numeric_candidate_columns(df, exclude={treatment_col})
+def _rank_candidate_features(df, treatment_col, treatment_binarized, extra_exclude=None):
+    candidate_cols = _numeric_candidate_columns(df, exclude={treatment_col} | set(extra_exclude or ()))
     leaky = _leakage_correlated_columns(df, treatment_col, treatment_binarized, candidate_cols)
     candidate_cols = [c for c in candidate_cols if c not in leaky]
     if not candidate_cols:
@@ -218,17 +218,25 @@ def _rank_candidate_features(df, treatment_col, treatment_binarized):
     return ranked, leaky
 
 
-def select_top_features(df, treatment_col, treatment_binarized, top_n=30):
+def select_top_features(df, treatment_col, treatment_binarized, top_n=None, extra_exclude=None):
     """
     Fits a GradientBoostingClassifier on every numeric candidate column
-    (minus leakage-correlated ones, see _leakage_correlated_columns) to rank
-    importance for predicting `treatment_binarized`. Always a fresh ranking
-    of whatever this dataset provides -- no memory of any previous model's
-    schema. Returns (top_n feature names, name->importance dict for every
-    ranked candidate, sorted list of columns excluded as leakage-correlated).
+    (minus leakage-correlated ones, see _leakage_correlated_columns, and minus
+    `extra_exclude` -- used by app.py's covariate-balance re-tune loop to drop
+    a feature that failed balance and re-rank without it) to rank importance
+    for predicting `treatment_binarized`. Always a fresh ranking of whatever
+    this dataset provides -- no memory of any previous model's schema.
+
+    `top_n=None` (the default) returns every ranked candidate -- no arbitrary
+    cutoff, so the response can show the full importance ranking and the
+    integrator decides what to actually use downstream. Pass an int to cap
+    it instead.
+
+    Returns (selected feature names, name->importance dict for every ranked
+    candidate, sorted list of columns excluded as leakage-correlated).
     """
-    ranked, leaky = _rank_candidate_features(df, treatment_col, treatment_binarized)
-    top = ranked[:top_n]
+    ranked, leaky = _rank_candidate_features(df, treatment_col, treatment_binarized, extra_exclude=extra_exclude)
+    top = ranked if top_n is None else ranked[:top_n]
     return [name for name, _ in top], {name: json_safe_float(imp) for name, imp in ranked}, sorted(leaky)
 
 
@@ -293,21 +301,22 @@ def logit(p):
     return np.log(p / (1 - p))
 
 
-def matched_att(ps_logit_final, treatments, outcomes, caliper_ratio=0.2, n_bootstrap=500, seed=42):
-    """Nearest-neighbor PS matching (within a logit-scale caliper) + paired
-    t-test + bootstrap CI for the ATT. Shared by both the baseline and
-    dynamic scoring paths in app.py -- everything upstream of this just
-    needs to produce a ps_logit array plus aligned treatment/outcome
-    arrays."""
+def _match_pairs(ps_logit_final, treatments, caliper_ratio=0.2):
+    """1-nearest-neighbor matching of treated to control units on the
+    logit-scale propensity score, within a caliper. Shared by matched_att
+    (needs outcomes too) and covariate_balance (doesn't). Returns
+    (matched_pairs, caliper, err) where matched_pairs is a list of
+    (treated_row_index, matched_control_row_index) tuples into the original
+    arrays; caliper is None and err is set on failure."""
     caliper = caliper_ratio * np.std(ps_logit_final)
     if not np.isfinite(caliper) or caliper <= 0:
-        return None, "invalid caliper computed from input data"
+        return None, None, "invalid caliper computed from input data"
 
     control_mask = treatments == 0
     treat_mask = treatments == 1
 
     if control_mask.sum() == 0 or treat_mask.sum() == 0:
-        return None, "need both treated and control records in input"
+        return None, None, "need both treated and control records in input"
 
     control_ps = ps_logit_final[control_mask].reshape(-1, 1)
     treat_ps = ps_logit_final[treat_mask].reshape(-1, 1)
@@ -323,6 +332,19 @@ def matched_att(ps_logit_final, treatments, outcomes, caliper_ratio=0.2, n_boots
     for j in range(len(treated_indices)):
         if distances[j][0] <= caliper:
             matched_pairs.append((treated_indices[j], control_indices[indices[j][0]]))
+
+    return matched_pairs, caliper, None
+
+
+def matched_att(ps_logit_final, treatments, outcomes, caliper_ratio=0.2, n_bootstrap=500, seed=42):
+    """Nearest-neighbor PS matching (within a logit-scale caliper) + paired
+    t-test + bootstrap CI for the ATT. Shared by both the baseline and
+    dynamic scoring paths in app.py -- everything upstream of this just
+    needs to produce a ps_logit array plus aligned treatment/outcome
+    arrays."""
+    matched_pairs, caliper, err = _match_pairs(ps_logit_final, treatments, caliper_ratio)
+    if err:
+        return None, err
 
     if len(matched_pairs) == 0:
         return {
@@ -360,3 +382,107 @@ def matched_att(ps_logit_final, treatments, outcomes, caliper_ratio=0.2, n_boots
         "p_value_paired_ttest": json_safe_float(p_val),
         "caliper": json_safe_float(caliper),
     }, None
+
+
+BALANCE_THRESHOLD = 0.1  # standard "well-balanced" cutoff for |SMD| in the PSM literature
+
+
+def standardized_mean_diff(X, treatments):
+    """
+    Per-column standardized mean difference: (mean_treated - mean_control) / pooled_std,
+    with pooled_std = sqrt((var_treated + var_control) / 2) (Cohen's-d-style pooling).
+    X: 2D numeric array (n_samples, n_features), row-aligned with `treatments` (0/1
+    array). Columns with zero pooled variance (constant in both groups) get SMD 0 --
+    no imbalance is possible on a column that doesn't vary.
+    """
+    treat_vals = X[treatments == 1]
+    control_vals = X[treatments == 0]
+    mean_t = treat_vals.mean(axis=0)
+    mean_c = control_vals.mean(axis=0)
+    var_t = treat_vals.var(axis=0, ddof=1) if treat_vals.shape[0] > 1 else np.zeros(X.shape[1])
+    var_c = control_vals.var(axis=0, ddof=1) if control_vals.shape[0] > 1 else np.zeros(X.shape[1])
+    pooled_std = np.sqrt((var_t + var_c) / 2)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        smd = np.where(pooled_std > 0, (mean_t - mean_c) / pooled_std, 0.0)
+    return smd
+
+
+def covariate_balance(df, treatment_binarized, feature_cols, ps_logit, caliper_ratio=0.2, balance_threshold=BALANCE_THRESHOLD):
+    """
+    Covariate balance diagnostics (pipeline step 7): standardized mean difference per
+    feature before and after 1-NN caliper matching (see _match_pairs), PS common-support
+    overlap between groups, and a balance_achieved verdict (mean |SMD after matching| <
+    balance_threshold -- falls back to pre-match SMD if no pairs matched). Also reports
+    the single worst-balanced feature, for a caller that wants to drop it and retry
+    (see app.py's /train re-tune loop).
+    """
+    treatments = treatment_binarized.to_numpy()
+    if (treatments == 0).sum() == 0 or (treatments == 1).sum() == 0:
+        return {
+            "balance_achieved": False,
+            "mean_abs_smd": None,
+            "balance_threshold": balance_threshold,
+            "matched_pairs": 0,
+            "caliper": None,
+            "overlap": {"treated_in_control_range_pct": None, "control_in_treated_range_pct": None},
+            "per_feature": [],
+            "worst_feature": None,
+            "error": "need both treated and control records to assess balance",
+        }
+
+    X = df[feature_cols].fillna(0).to_numpy(dtype=float)
+    pre_smd = standardized_mean_diff(X, treatments)
+
+    matched_pairs, caliper, err = _match_pairs(ps_logit, treatments, caliper_ratio)
+
+    if err or not matched_pairs:
+        per_feature = [
+            {"feature": name, "smd_before": json_safe_float(pre), "smd_after": None}
+            for name, pre in zip(feature_cols, pre_smd)
+        ]
+        mean_abs_smd = float(np.mean(np.abs(pre_smd))) if len(pre_smd) else None
+        worst_idx = int(np.argmax(np.abs(pre_smd))) if len(pre_smd) else None
+        return {
+            "balance_achieved": mean_abs_smd is not None and mean_abs_smd < balance_threshold,
+            "mean_abs_smd": json_safe_float(mean_abs_smd) if mean_abs_smd is not None else None,
+            "balance_threshold": balance_threshold,
+            "matched_pairs": 0,
+            "caliper": json_safe_float(caliper) if caliper is not None else None,
+            "overlap": {"treated_in_control_range_pct": None, "control_in_treated_range_pct": None},
+            "per_feature": per_feature,
+            "worst_feature": feature_cols[worst_idx] if worst_idx is not None else None,
+        }
+
+    treat_idx = np.array([p[0] for p in matched_pairs])
+    ctrl_idx = np.array([p[1] for p in matched_pairs])
+    matched_treatments = np.concatenate([np.ones(len(treat_idx)), np.zeros(len(ctrl_idx))])
+    matched_X = np.concatenate([X[treat_idx], X[ctrl_idx]], axis=0)
+    post_smd = standardized_mean_diff(matched_X, matched_treatments)
+
+    per_feature = [
+        {"feature": name, "smd_before": json_safe_float(pre), "smd_after": json_safe_float(post)}
+        for name, pre, post in zip(feature_cols, pre_smd, post_smd)
+    ]
+    abs_post = np.abs(post_smd)
+    worst_idx = int(np.argmax(abs_post))
+    mean_abs_smd = float(np.mean(abs_post))
+
+    control_ps = ps_logit[treatments == 0]
+    treat_ps = ps_logit[treatments == 1]
+    c_lo, c_hi = float(np.min(control_ps)), float(np.max(control_ps))
+    t_lo, t_hi = float(np.min(treat_ps)), float(np.max(treat_ps))
+    overlap = {
+        "treated_in_control_range_pct": json_safe_float(float(np.mean((treat_ps >= c_lo) & (treat_ps <= c_hi)) * 100)),
+        "control_in_treated_range_pct": json_safe_float(float(np.mean((control_ps >= t_lo) & (control_ps <= t_hi)) * 100)),
+    }
+
+    return {
+        "balance_achieved": mean_abs_smd < balance_threshold,
+        "mean_abs_smd": json_safe_float(mean_abs_smd),
+        "balance_threshold": balance_threshold,
+        "matched_pairs": int(len(matched_pairs)),
+        "caliper": json_safe_float(caliper),
+        "overlap": overlap,
+        "per_feature": per_feature,
+        "worst_feature": feature_cols[worst_idx],
+    }
