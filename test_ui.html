@@ -164,7 +164,7 @@ document.getElementById("scoreBtn").addEventListener("click", async () => {
   out.textContent = "";
 
   try {
-    const res = await fetch(`${API_BASE}/predict_ps_batch`, { method: "POST", body: form });
+    const res = await fetch(`${API_BASE}/train/predict_ps_batch`, { method: "POST", body: form });
     const body = await res.json();
     out.textContent = JSON.stringify(body, null, 2);
     if (res.ok) {

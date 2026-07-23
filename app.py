@@ -92,10 +92,17 @@ STATE = {
     "source_filename": None,
     "rows": None,
     "trained_at": None,
+    "trained_columns": None,
+    "excluded_as_leakage": None,
+    "dropped_for_rebalancing": None,
 }
 
 MIN_TRAINING_ROWS = 10
-TOP_N_FEATURES = 30
+# No cap on selected features -- every non-leakage-correlated numeric candidate
+# column is ranked, used to fit the model, and reported with its importance.
+# Curating that list down further is left to the integrator, not this service.
+TOP_N_FEATURES = None
+MAX_RETRAIN_ATTEMPTS = 3
 
 
 def load_state():
@@ -185,7 +192,7 @@ def _decision_support_payload(df, ps):
 
 @app.route("/", methods=["GET"])
 def test_ui():
-    """Manual smoke-test page for POST /train and POST /predict_ps_batch --
+    """Manual smoke-test page for POST /train and POST /train/predict_ps_batch --
     not part of the production integration path (see README's integration
     guide), just a way to drive an upload through a browser instead of curl."""
     return send_from_directory(os.path.dirname(os.path.abspath(__file__)), "test_ui.html")
@@ -199,20 +206,34 @@ def train():
       treatment_column: <col name>   optional -- bypasses auto-detection if
                                       the heuristic picks the wrong column
 
-    Deletes whatever dynamic model is currently active and trains a
-    completely fresh one on this upload -- Teachable-Machine style. Every
-    call: auto-detects the treatment/control column (see
+    If the uploaded CSV's column set exactly matches the columns of whatever
+    dataset last trained the active dynamic model, retraining is skipped --
+    the existing model is reused as-is and just re-scored against this
+    upload. Any other column set retrains from scratch, Teachable-Machine
+    style: auto-detects the treatment/control column (see
     psm_core.detect_treatment_column), ranks every usable numeric column by
     importance for predicting it (excluding near-perfect treatment proxies,
-    see psm_core._leakage_correlated_columns), keeps the top 30
-    (psm_core.select_top_features), and fits a fresh model on just those
-    (psm_core.train_psm_model). Nothing carries over from whatever was
-    trained before -- there is no merge, no reuse-shortcut.
+    see psm_core._leakage_correlated_columns), and fits a fresh model on
+    every ranked candidate -- no top-N cap (psm_core.select_top_features,
+    psm_core.train_psm_model). The full ranking ships in the response
+    (feature_selection.selected / model_interpretation.feature_contributions)
+    so the integrator can curate the list further downstream; this service
+    doesn't cut it down for you. If covariate balance isn't achieved (mean
+    |SMD| after matching >= 0.1, see psm_core.covariate_balance), the single
+    worst-balanced feature is dropped and training retries, up to
+    MAX_RETRAIN_ATTEMPTS times.
 
-    /predict_ps, /estimate_att, /predict_ps_batch score against whichever
-    model currently applies: the frozen baseline if the request covers all
-    57 raw features, otherwise this dynamic model, persisted under
-    models/dynamic/ so a restart doesn't lose it.
+    Response includes, alongside the trained-model summary: feature_selection
+    (selected features + what got excluded and why), ps_output (in-sample
+    propensity scores for this upload), covariate_balance (SMD before/after
+    matching, PS overlap, balance_achieved verdict), model_interpretation
+    (feature_importances_ from the fitted GradientBoostingClassifier -- not
+    true SHAP values), and decision_support (PS-quartile table).
+
+    /train/predict_ps, /train/estimate_att, /train/predict_ps_batch score
+    against whichever model currently applies: the frozen baseline if the
+    request covers all 57 raw features, otherwise this dynamic model,
+    persisted under models/dynamic/ so a restart doesn't lose it.
     """
     file = request.files.get("file")
     if file is None:
@@ -226,45 +247,112 @@ def train():
     if len(df) < MIN_TRAINING_ROWS:
         return jsonify({"error": f"dataset too small to train on (need at least {MIN_TRAINING_ROWS} rows, got {len(df)})"}), 400
 
-    override_col = request.form.get("treatment_column") or None
-    try:
-        treatment_col, treatment_binarized, method = core.detect_treatment_column(df, override_col=override_col)
-    except ValueError as e:
-        return jsonify({"error": str(e)}), 400
-    if treatment_col is None:
-        return jsonify({"error": "could not auto-detect a treatment/control column in this dataset; retry with a 'treatment_column' form field"}), 400
+    uploaded_columns = sorted(df.columns)
+    retrain_skipped = (
+        STATE["model"] is not None
+        and STATE.get("trained_columns") == uploaded_columns
+    )
 
-    try:
-        top_features, _, excluded_leakage = core.select_top_features(df, treatment_col, treatment_binarized, top_n=TOP_N_FEATURES)
-        model, final_importances = core.train_psm_model(df, treatment_binarized, top_features)
-    except ValueError as e:
-        return jsonify({"error": str(e)}), 400
+    if retrain_skipped:
+        try:
+            treatment_col, treatment_binarized, method = core.detect_treatment_column(df, override_col=STATE["treatment_col"])
+        except ValueError as e:
+            return jsonify({"error": str(e)}), 400
+        model = STATE["model"]
+        top_features = STATE["feature_cols"]
+        final_importances = STATE["importances"]
+        excluded_leakage = STATE.get("excluded_as_leakage") or []
+        dropped_for_rebalancing = STATE.get("dropped_for_rebalancing") or []
+        retrain_attempts = 0
+    else:
+        override_col = request.form.get("treatment_column") or None
+        try:
+            treatment_col, treatment_binarized, method = core.detect_treatment_column(df, override_col=override_col)
+        except ValueError as e:
+            return jsonify({"error": str(e)}), 400
+        if treatment_col is None:
+            return jsonify({"error": "could not auto-detect a treatment/control column in this dataset; retry with a 'treatment_column' form field"}), 400
 
-    STATE.update({
-        "model": model,
-        "feature_cols": top_features,
-        "importances": final_importances,
-        "treatment_col": treatment_col,
-        "treatment_method": method,
-        "source_filename": file.filename,
-        "rows": len(df),
-        "trained_at": time.time(),
-    })
-    save_state()
+        extra_exclude = set()
+        dropped_for_rebalancing = []
+        model, top_features, final_importances, excluded_leakage = None, None, None, None
+        balance = None
+        for attempt in range(1, MAX_RETRAIN_ATTEMPTS + 1):
+            retrain_attempts = attempt
+            try:
+                top_features, final_importances, excluded_leakage = core.select_top_features(
+                    df, treatment_col, treatment_binarized, top_n=TOP_N_FEATURES, extra_exclude=extra_exclude)
+                model, _ = core.train_psm_model(df, treatment_binarized, top_features)
+            except ValueError as e:
+                return jsonify({"error": str(e)}), 400
+
+            ps, _X = _score("dynamic", model, top_features, None, df)
+            balance = core.covariate_balance(df, treatment_binarized, top_features, core.logit(ps))
+            if balance["balance_achieved"] or not balance.get("worst_feature") or attempt == MAX_RETRAIN_ATTEMPTS:
+                break
+            dropped_for_rebalancing.append(balance["worst_feature"])
+            extra_exclude.add(balance["worst_feature"])
+
+        STATE.update({
+            "model": model,
+            "feature_cols": top_features,
+            "importances": final_importances,
+            "treatment_col": treatment_col,
+            "treatment_method": method,
+            "source_filename": file.filename,
+            "rows": len(df),
+            "trained_at": time.time(),
+            "trained_columns": uploaded_columns,
+            "excluded_as_leakage": excluded_leakage,
+            "dropped_for_rebalancing": dropped_for_rebalancing,
+        })
+        save_state()
+
+    ps, _X = _score("dynamic", model, top_features, None, df)
+    ps_logit_arr = core.logit(ps)
+    balance = core.covariate_balance(df, treatment_binarized, top_features, ps_logit_arr)
+    _, decision_support = _decision_support_payload(df, ps)
 
     ranked = sorted(final_importances.items(), key=lambda kv: kv[1], reverse=True)
+    ranked_features = [{"feature": name, "importance": imp} for name, imp in ranked]
+
     return jsonify({
         "status": "trained",
+        "retrained": not retrain_skipped,
+        "retrain_attempts": retrain_attempts,
         "rows": len(df),
         "treatment_column": treatment_col,
         "treatment_detection_method": method,
+        "feature_selection": {
+            "n_features_selected": len(top_features),
+            "selected": ranked_features,
+            "excluded_as_leakage": excluded_leakage,
+            "dropped_for_rebalancing": dropped_for_rebalancing,
+        },
+        "ps_output": {
+            "ps": [core.json_safe_float(v) for v in ps],
+            "ps_logit": [core.json_safe_float(v) for v in ps_logit_arr],
+            "ps_summary": {
+                "min": core.json_safe_float(np.min(ps)),
+                "max": core.json_safe_float(np.max(ps)),
+                "mean": core.json_safe_float(np.mean(ps)),
+                "median": core.json_safe_float(np.median(ps)),
+            },
+        },
+        "covariate_balance": balance,
+        "model_interpretation": {
+            "method": "GradientBoostingClassifier.feature_importances_ (not SHAP)",
+            "feature_contributions": ranked_features,
+        },
+        "decision_support": decision_support,
+        # kept for backwards compatibility with existing callers
         "n_features_selected": len(top_features),
-        "top_features": [{"feature": name, "importance": imp} for name, imp in ranked],
+        "top_features": ranked_features,
         "excluded_as_leakage": excluded_leakage,
     })
 
 
-@app.route("/predict_ps", methods=["POST"])
+@app.route("/train/predict_ps", methods=["POST"])
 def predict_ps():
     """
     JSON body: { "records": [ { "<column_name>": value, ... }, ... ] }
@@ -295,7 +383,7 @@ def predict_ps():
     })
 
 
-@app.route("/estimate_att", methods=["POST"])
+@app.route("/train/estimate_att", methods=["POST"])
 def estimate_att():
     """
     JSON body:
@@ -345,14 +433,14 @@ def estimate_att():
     return jsonify(result)
 
 
-@app.route("/predict_ps_batch", methods=["POST"])
+@app.route("/train/predict_ps_batch", methods=["POST"])
 def predict_ps_batch():
     """
     multipart/form-data: file: <CSV file>   required
 
-    Whole-dataset counterpart to /predict_ps: scores every row and returns a
-    decision-support table stratified by propensity-score quartile,
-    alongside the raw per-row scores.
+    Whole-dataset counterpart to /train/predict_ps: scores every row and
+    returns a decision-support table stratified by propensity-score
+    quartile, alongside the raw per-row scores.
     """
     file = request.files.get("file")
     if file is None:
