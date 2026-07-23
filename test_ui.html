@@ -21,11 +21,19 @@
     margin-top: 0.75rem;
   }
   label { display: block; font-weight: 600; margin-bottom: 0.25rem; font-size: 0.9rem; }
-  input[type="file"], input[type="text"] {
+  input[type="file"], input[type="text"], select {
     display: block;
     margin-bottom: 0.75rem;
     width: 100%;
     box-sizing: border-box;
+  }
+  select {
+    padding: 0.4rem;
+    border-radius: 6px;
+    border: 1px solid #8884;
+    background: transparent;
+    color: inherit;
+    font-size: 0.9rem;
   }
   button {
     background: #2563eb;
@@ -73,8 +81,10 @@
 <div class="card">
   <label for="trainFile">CSV file</label>
   <input type="file" id="trainFile" accept=".csv">
-  <label for="treatmentCol">Treatment column override (optional)</label>
-  <input type="text" id="treatmentCol" placeholder="leave blank to auto-detect">
+  <label for="treatmentCol">Treatment column (optional -- pick the file first to populate this)</label>
+  <select id="treatmentCol">
+    <option value="">Auto-detect (recommended)</option>
+  </select>
   <button id="trainBtn">Train</button>
   <div id="trainStatus" class="status"></div>
   <pre id="trainOut">(no response yet)</pre>
@@ -106,6 +116,42 @@ async function loadHealth() {
 
 document.getElementById("refreshHealth").addEventListener("click", loadHealth);
 loadHealth();
+
+// Naive CSV header split -- good enough for picking a column name out of a
+// header row; doesn't handle quoted fields containing commas.
+function parseCsvHeader(text) {
+  const firstLine = text.split(/\r\n|\r|\n/, 1)[0] || "";
+  return firstLine.split(",").map(h => h.trim().replace(/^"|"$/g, "")).filter(Boolean);
+}
+
+function populateTreatmentColumnOptions(headers) {
+  const select = document.getElementById("treatmentCol");
+  select.innerHTML = "";
+  const autoOpt = document.createElement("option");
+  autoOpt.value = "";
+  autoOpt.textContent = "Auto-detect (recommended)";
+  select.appendChild(autoOpt);
+  for (const h of headers) {
+    const opt = document.createElement("option");
+    opt.value = h;
+    opt.textContent = h;
+    select.appendChild(opt);
+  }
+}
+
+document.getElementById("trainFile").addEventListener("change", (e) => {
+  const file = e.target.files[0];
+  const select = document.getElementById("treatmentCol");
+  if (!file) {
+    select.innerHTML = '<option value="">Auto-detect (recommended)</option>';
+    return;
+  }
+  const reader = new FileReader();
+  reader.onload = () => populateTreatmentColumnOptions(parseCsvHeader(reader.result));
+  reader.onerror = () => populateTreatmentColumnOptions([]);
+  // First 4KB is always enough to cover a header row.
+  reader.readAsText(file.slice(0, 4096));
+});
 
 document.getElementById("trainBtn").addEventListener("click", async () => {
   const fileInput = document.getElementById("trainFile");

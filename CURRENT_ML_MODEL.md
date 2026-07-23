@@ -57,7 +57,13 @@ whether the model changed.
 ### Feature selection — no cap
 
 1. Auto-detect the treatment/control column (`psm_core.detect_treatment_column`;
-   override via `treatment_column` form field).
+   override via `treatment_column` form field). `test_ui.html`'s train form exposes
+   this as a `<select>` dropdown: picking a CSV file parses just its header row
+   client-side (`FileReader`, first 4KB) and populates the dropdown with the actual
+   column names, defaulting to "Auto-detect" -- no need to already know or type the
+   exact column name. Confirmed end-to-end: selecting a column other than the
+   auto-detector's obvious pick still submits `treatment_column` and the response
+   comes back with `treatment_detection_method: "manual_override"` for that column.
 2. Rank every numeric, non-ID-like candidate column by importance for predicting
    treatment (`psm_core.select_top_features`, a throwaway
    `GradientBoostingClassifier`).
