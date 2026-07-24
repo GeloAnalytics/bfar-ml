@@ -249,9 +249,14 @@ def train():
         return jsonify({"error": f"dataset too small to train on (need at least {MIN_TRAINING_ROWS} rows, got {len(df)})"}), 400
 
     uploaded_columns = sorted(df.columns)
+    override_col = request.form.get("treatment_column") or None
     retrain_skipped = (
         STATE["model"] is not None
         and STATE.get("trained_columns") == uploaded_columns
+        # An explicit override naming a *different* column than what's already
+        # active is a deliberate request to redo training under that column --
+        # honor it instead of silently reusing the old model's treatment column.
+        and (override_col is None or override_col == STATE.get("treatment_col"))
     )
 
     if retrain_skipped:
@@ -270,7 +275,6 @@ def train():
         dropped_for_rebalancing = STATE.get("dropped_for_rebalancing") or []
         retrain_attempts = 0
     else:
-        override_col = request.form.get("treatment_column") or None
         try:
             treatment_col, treatment_binarized, method = core.detect_treatment_column(df, override_col=override_col)
         except ValueError as e:
