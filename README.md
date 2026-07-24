@@ -16,10 +16,19 @@ app in a background thread, started together by `python app.py`:
 The dynamic model works **Teachable-Machine style**: every `POST /train` call with a
 new column set deletes whatever model is currently active and trains a completely
 fresh one on the new upload -- ranking every usable column by feature importance and
-fitting on all of them, no top-N cap and no merging with the previous schema. The full
-ranking ships in the response (`feature_selection.selected`); curating that list down
-further is left to the integrator, not this service. If the uploaded CSV's columns
-exactly match the columns of whatever dataset trained the currently active model,
+fitting on all of them, no top-N cap and no merging with the previous schema. Before
+ranking, candidates are narrowed by four filters (each reported separately in
+`feature_selection`): low data coverage, a demographic/respondent-identity keyword
+match (generic survey terms like age/area/sex/education, not bfar-specific), a
+before/after wave-pair structural match (a column that's the "current" half of a pair
+sharing an identical name except for one A/B token -- confirmed against the actual
+BFAR beneficiary questionnaire's baseline/endline design), and leakage correlation with
+treatment. `exclude_columns`/`include_columns` form fields let the caller override
+these per upload for dataset-specific judgment calls the engine can't infer generically
+(e.g. a "current wave" column with no structural "before" pair to match against). The
+full ranking ships in the response (`feature_selection.selected`); curating that list
+down further is left to the integrator, not this service. If the uploaded CSV's
+columns (and exclude/include overrides) exactly match whatever's already active,
 training is skipped entirely and the existing model is reused as-is (`retrained: false`
 in the response) -- only re-scored against the new upload. See `DYNAMIC_TRAINING.md`
 for the full design and why this replaced an earlier index-mapping approach.
@@ -164,19 +173,32 @@ After a `/train` call, `dynamic` instead looks like:
 ```bash
 curl -X POST http://localhost:8000/train -F "file=@mydataset.csv"
 ```
-Optional form field: `treatment_column=enrolled_flag` (bypasses auto-detection).
+Optional form fields:
+- `treatment_column=enrolled_flag` -- bypasses auto-detection
+- `exclude_columns=col_a,col_b` -- drops these from candidates outright, e.g. columns
+  known (for this specific dataset) to be post-treatment or derived/circular, with no
+  generic signal indicating that
+- `include_columns=col_c` -- exempts these from the demographic/wave-pair exclusion
+  (see below) even if they'd otherwise match
 
-**If the uploaded CSV's column set exactly matches the columns that trained the
-currently active model, retraining is skipped** (`retrained: false`) and that model is
+**If the uploaded CSV's column set (and exclude/include overrides) exactly matches
+what's already active, retraining is skipped** (`retrained: false`) and that model is
 just re-scored against this upload. Otherwise it deletes whatever dynamic model is
-currently active and trains a completely fresh one -- ranks every usable numeric
-column by importance for predicting the detected treatment column (excluding
-near-perfect treatment proxies), then fits on **all** of them -- no top-N cap; the full
-ranking ships back in `feature_selection.selected` and it's on the integrator to
-curate that list further if they want a smaller feature set. If covariate balance
-isn't achieved, drops the single worst-balanced feature and retries (up to 3 attempts
-total, see `retrain_attempts`). Nothing carries over from any previous `/train` call
-that actually retrained.
+currently active and trains a completely fresh one. Candidates are narrowed down
+first, in order: (1) low data coverage in this upload -- dataset-agnostic; (2) a
+demographic/respondent-identity keyword match in the column name -- generic survey
+terms (age, area, sex, education...), not tied to any one program's naming scheme;
+(3) a before/after wave-pair structural match -- a column that's the "current" half of
+a pair sharing an identical name except for one isolated A/B token (confirmed against
+a real beneficiary-program questionnaire's baseline/endline design; a structural
+pattern, not a hardcoded word list, so it generalizes across similar before/after
+survey designs); (4) near-perfect correlation with treatment. `include_columns`
+exempts specific columns from checks 2-3. Whatever survives fits in full -- no top-N
+cap; the full ranking ships back in `feature_selection.selected` and it's on the
+integrator to curate that list further if they want a smaller feature set. If
+covariate balance isn't achieved, drops the single worst-balanced feature and retries
+(up to 3 attempts total, see `retrain_attempts`). Nothing carries over from any
+previous `/train` call that actually retrained.
 ```json
 {
   "status": "trained",
@@ -189,7 +211,12 @@ that actually retrained.
     "n_features_selected": 27,
     "selected": [{"feature": "monthly_income", "importance": 0.11}, "..."],
     "excluded_as_leakage": ["group_assignment_code"],
-    "dropped_for_rebalancing": []
+    "excluded_as_context": ["respondent_age"],
+    "excluded_as_wave_pair": ["assets_endline_motorcycle"],
+    "excluded_as_low_coverage": ["unused_field"],
+    "dropped_for_rebalancing": [],
+    "manually_excluded": [],
+    "manually_included": []
   },
   "ps_output": {
     "ps": [0.42, "..."],
