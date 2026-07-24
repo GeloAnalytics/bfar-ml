@@ -250,6 +250,73 @@ def train_psm_model(df, treatment_binarized, feature_cols):
     return model, importances
 
 
+def _ordinal(n):
+    suffix = "th" if 10 <= n % 100 <= 20 else {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
+    return f"{n}{suffix}"
+
+
+def compute_shap_feature_contributions(model, X, feature_cols):
+    """
+    Real SHAP values (shap.TreeExplainer -- exact, not approximated, for
+    tree-ensemble models like GradientBoostingClassifier) explaining this
+    model's predictions in terms of `feature_cols`. `X` should be the same
+    fillna(0) frame used to fit/score the model.
+
+    Returns a list of {feature, mean_abs_shap, mean_shap, direction} dicts
+    sorted by mean_abs_shap descending -- the standard "global SHAP feature
+    importance" view (mean absolute SHAP value per feature across every
+    row), plus the signed mean, which tells you the *direction* of the
+    effect: whether higher values of that feature push predictions toward
+    treatment=1 ("increases_likelihood") or treatment=0
+    ("decreases_likelihood") on average. Values are in the model's raw
+    margin (log-odds) space, not probability space -- shap.TreeExplainer's
+    default for classifiers, and not comparable in magnitude to a
+    probability difference.
+    """
+    import shap
+
+    explainer = shap.TreeExplainer(model)
+    shap_values = np.asarray(explainer.shap_values(X))
+    if shap_values.ndim == 3:
+        # Some shap/model combinations return (n_samples, n_features, n_classes);
+        # keep the positive class.
+        shap_values = shap_values[:, :, -1]
+
+    mean_abs = np.abs(shap_values).mean(axis=0)
+    mean_signed = shap_values.mean(axis=0)
+
+    contributions = [
+        {
+            "feature": name,
+            "mean_abs_shap": json_safe_float(abs_val),
+            "mean_shap": json_safe_float(signed_val),
+            "direction": "increases_likelihood" if signed_val > 0 else "decreases_likelihood",
+        }
+        for name, abs_val, signed_val in zip(feature_cols, mean_abs, mean_signed)
+    ]
+    contributions.sort(key=lambda c: c["mean_abs_shap"] or 0, reverse=True)
+    return contributions
+
+
+def generate_socioeconomic_insights(feature_contributions, top_n=5):
+    """
+    Plain-language summary of the top `top_n` SHAP-ranked features --
+    generic template sentences built from whatever column names this
+    dataset provides. No hardcoded knowledge of what a given column means;
+    this doesn't tie the wording to bfar.csv or any one program.
+    """
+    insights = []
+    for rank, contrib in enumerate(feature_contributions[:top_n], start=1):
+        direction_phrase = "a higher" if contrib["direction"] == "increases_likelihood" else "a lower"
+        rank_phrase = "the strongest" if rank == 1 else f"the {_ordinal(rank)}-strongest"
+        insights.append(
+            f"\"{contrib['feature']}\" is {rank_phrase} factor distinguishing participants from "
+            f"non-participants in this dataset -- higher values of this feature are associated with "
+            f"{direction_phrase} likelihood of being in the treatment group."
+        )
+    return insights
+
+
 def decision_support_table(df_with_ps, key_features=None, ps_col="ps"):
     """
     Stratifies rows into PS quartiles and summarizes each group -- the

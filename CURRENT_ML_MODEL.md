@@ -4,7 +4,13 @@ A record of what's actually implemented, written from `app.py`, `psm_core.py`, a
 `build_model.py` as they stand right now. Supersedes the pre-pipeline-upgrade version
 of this document — retrain-skip, `/train/*` URL nesting, and the covariate-balance /
 model-interpretation / decision-support additions to `/train`'s response (steps 6, 7,
-9, 10 below) are now live.
+9, 10 below) are now live, and step 9 uses real SHAP values (`shap.TreeExplainer`),
+not a feature-importances_ stand-in.
+
+A more elaborate demographic-keyword / before-after-wave-pair column exclusion system
+was built, tested, and then reverted — too complex for the value it added. Column
+selection right now is back to: numeric, non-ID-like, minus leakage-correlated with
+treatment. Revisit with something simpler later.
 
 ## 1. Architecture
 
@@ -122,9 +128,12 @@ to `models/dynamic/` (`model.pkl` + `meta.json`) so a restart doesn't lose them.
     "per_feature": [{"feature", "smd_before", "smd_after"}, ...],
     "worst_feature": str
   },
-  "model_interpretation": {          # step 9 — NOT true SHAP, see below
-    "method": "GradientBoostingClassifier.feature_importances_ (not SHAP)",
-    "feature_contributions": [{"feature": str, "importance": float}, ...]
+  "model_interpretation": {          # step 9 — real SHAP values
+    "method": "SHAP (shap.TreeExplainer, exact for tree-ensemble models) ...",
+    "feature_contributions": [
+      {"feature": str, "mean_abs_shap": float, "mean_shap": float, "direction": "increases_likelihood"|"decreases_likelihood"}, ...
+    ],
+    "socioeconomic_insights": [str, ...]   # plain-language, generated from the top few contributions
   },
   "decision_support": [{"ps_group", "count", "interpretation", "mean_*"}, ...],  # step 10
   # kept for backwards compatibility with pre-upgrade callers:
@@ -132,11 +141,17 @@ to `models/dynamic/` (`model.pkl` + `meta.json`) so a restart doesn't lose them.
 }
 ```
 
-`model_interpretation` deliberately reuses the same `feature_importances_` values
-already computed for ranking/selection rather than computing true SHAP values — no
-`shap` package dependency was added. If real Shapley values are needed later, this is
-the section to swap out (`psm_core` would need a `shap.TreeExplainer` call against the
-fitted `GradientBoostingClassifier`).
+`model_interpretation` uses real SHAP values (`psm_core.compute_shap_feature_contributions`,
+`shap.TreeExplainer` against the fitted `GradientBoostingClassifier` -- exact, not
+approximated, since tree ensembles have a closed-form SHAP computation). Reports the
+mean absolute SHAP value per feature across every row in this upload (the standard
+"global SHAP importance" view, not a per-row breakdown -- keeps the response a
+reasonable size), the signed mean (which direction the feature pushes predictions),
+and `socioeconomic_insights`: generic template sentences built from the top-ranked
+features' names and directions, not tied to any one program's column-naming scheme.
+SHAP values are in the model's raw log-odds (margin) space, not probability space --
+not directly comparable in magnitude to a probability difference. Adds `shap` as a
+new dependency (`requirements.txt`).
 
 ## 5. Scoring (`/train/predict_ps`, `/train/estimate_att`, `/train/predict_ps_batch`,
    and their static-port equivalents without the `/train` prefix)
@@ -169,7 +184,7 @@ PS quartiles.
 | 6. PS output | ✅ `ps_output` in `/train`'s response, `ps_final`/`ps` in scoring responses |
 | 7. Covariate balance diagnostics | ✅ `covariate_balance` in `/train`'s response (SMD, overlap, balance_achieved + auto re-tune) |
 | 8. Causal estimation (matching/ATT) | ✅ `/train/estimate_att` (and static `/estimate_att`) |
-| 9. Model interpretation | ⚠️ `model_interpretation` in `/train`'s response, but `feature_importances_`, not true SHAP (by choice — no new dependency) |
+| 9. Model interpretation | ✅ `model_interpretation` in `/train`'s response -- real SHAP values (`shap.TreeExplainer`) plus generated socioeconomic insights |
 | 10. Decision support system | ⚠️ `decision_support` quartile table (in `/train` and `/train/predict_ps_batch`); no generated reports or visualizations beyond the raw table |
 
 ## 8. Known limitations
@@ -181,4 +196,7 @@ PS quartiles.
   up discarding a feature that was actually carrying real signal (it optimizes for
   balance, not predictive accuracy).
 - No cross-validation or held-out evaluation for the dynamic path.
-- `model_interpretation` is feature importance, not SHAP.
+- Column selection is currently just numeric + non-ID-like + leakage-correlation
+  exclusion -- no automatic filtering of demographic columns or before/after
+  survey-wave pairs (a more elaborate version of this was tried and reverted for
+  being too complex; revisit later with a simpler mechanism).
