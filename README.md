@@ -207,8 +207,14 @@ that actually retrained.
     "worst_feature": "household_size"
   },
   "model_interpretation": {
-    "method": "GradientBoostingClassifier.feature_importances_ (not SHAP)",
-    "feature_contributions": [{"feature": "monthly_income", "importance": 0.11}, "..."]
+    "method": "SHAP (shap.TreeExplainer, exact for tree-ensemble models) ...",
+    "feature_contributions": [
+      {"feature": "monthly_income", "mean_abs_shap": 0.34, "mean_shap": 0.21, "direction": "increases_likelihood"}, "..."
+    ],
+    "socioeconomic_insights": [
+      "\"monthly_income\" is the strongest factor distinguishing participants from non-participants in this dataset -- higher values of this feature are associated with a higher likelihood of being in the treatment group.",
+      "..."
+    ]
   },
   "decision_support": [{"ps_group": "Low", "count": 103, "interpretation": "Very low likelihood - may need targeted outreach"}, "..."]
 }
@@ -216,9 +222,14 @@ that actually retrained.
 `covariate_balance` (pipeline step 7) reports standardized mean difference per feature
 before/after 1-NN caliper matching, propensity-score common-support overlap between
 groups, and a `balance_achieved` verdict (mean |SMD after matching| `< 0.1`) --
-`psm_core.covariate_balance`. `model_interpretation` (step 9) is the same
-`feature_importances_` used for selection, explicitly labeled as not being true SHAP
-(no `shap` dependency is installed). `decision_support` (step 10) is the same
+`psm_core.covariate_balance`. `model_interpretation` (step 9) is real SHAP values
+(`psm_core.compute_shap_feature_contributions`, `shap.TreeExplainer` -- exact for tree
+ensembles, not approximated): mean absolute SHAP value per feature across every row in
+this upload (not a per-row breakdown, to keep the response a reasonable size), the
+signed mean (which direction the feature pushes predictions), and
+`socioeconomic_insights` -- generic template sentences built from the top-ranked
+features, not tied to any one program's naming scheme. SHAP values are in the model's
+raw log-odds space, not probability space. `decision_support` (step 10) is the same
 PS-quartile table `/train/predict_ps_batch` returns, computed in-sample on the
 training upload itself.
 
@@ -264,4 +275,4 @@ feature. Optional body fields: `treatmentKey` (default `"treatment"`), `outcomeK
 
 ## Notebooks
 
-`updated_psm.ipynb` and `predictor_psm.ipynb` (not part of this repo, kept alongside it) contain the fuller research workflow the baseline model is drawn from -- model selection with ROC/calibration plots, balance diagnostics, SHAP explainability, and IPW-based ATT estimation as a cross-check against the matching-based estimate served here. The live API intentionally exposes only baseline-scoring and dynamic training/scoring; SHAP and IPW remain notebook-only analysis steps.
+`updated_psm.ipynb` and `predictor_psm.ipynb` (not part of this repo, kept alongside it) contain the fuller research workflow the baseline model is drawn from -- model selection with ROC/calibration plots, balance diagnostics, SHAP explainability, and IPW-based ATT estimation as a cross-check against the matching-based estimate served here. `POST /train`'s `model_interpretation` now surfaces real SHAP values too (see above); IPW-based ATT remains a notebook-only cross-check, not exposed by the live API (which uses matching, see `psm_core.matched_att`).

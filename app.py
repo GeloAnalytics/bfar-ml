@@ -228,8 +228,9 @@ def train():
     (selected features + what got excluded and why), ps_output (in-sample
     propensity scores for this upload), covariate_balance (SMD before/after
     matching, PS overlap, balance_achieved verdict), model_interpretation
-    (feature_importances_ from the fitted GradientBoostingClassifier -- not
-    true SHAP values), and decision_support (PS-quartile table).
+    (real SHAP values via shap.TreeExplainer -- mean |SHAP value| per feature
+    plus plain-language socioeconomic_insights), and decision_support
+    (PS-quartile table).
 
     /train/predict_ps, /train/estimate_att, /train/predict_ps_batch score
     against whichever model currently applies: the frozen baseline if the
@@ -317,10 +318,13 @@ def train():
         })
         save_state()
 
-    ps, _X = _score("dynamic", model, top_features, None, df)
+    ps, X_used = _score("dynamic", model, top_features, None, df)
     ps_logit_arr = core.logit(ps)
     balance = core.covariate_balance(df, treatment_binarized, top_features, ps_logit_arr)
     _, decision_support = _decision_support_payload(df, ps)
+
+    shap_contributions = core.compute_shap_feature_contributions(model, X_used, top_features)
+    socioeconomic_insights = core.generate_socioeconomic_insights(shap_contributions)
 
     ranked = sorted(final_importances.items(), key=lambda kv: kv[1], reverse=True)
     ranked_features = [{"feature": name, "importance": imp} for name, imp in ranked]
@@ -350,8 +354,10 @@ def train():
         },
         "covariate_balance": balance,
         "model_interpretation": {
-            "method": "GradientBoostingClassifier.feature_importances_ (not SHAP)",
-            "feature_contributions": ranked_features,
+            "method": "SHAP (shap.TreeExplainer, exact for tree-ensemble models) -- mean |SHAP value| "
+                      "per feature across all rows in this upload, in the model's raw log-odds space",
+            "feature_contributions": shap_contributions,
+            "socioeconomic_insights": socioeconomic_insights,
         },
         "decision_support": decision_support,
         # kept for backwards compatibility with existing callers
