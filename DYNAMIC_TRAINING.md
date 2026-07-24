@@ -62,43 +62,12 @@ model. Any column added, removed, or renamed forces a full retrain.
 1. Parse the uploaded CSV; reject if fewer than 10 rows.
 2. Auto-detect the treatment/control column (`psm_core.detect_treatment_column`;
    override with the `treatment_column` form field if it guesses wrong).
-3. Narrow numeric, non-ID-like candidate columns through four filters, each
-   reported separately in the response (`feature_selection.excluded_as_*`):
-   - **Low data coverage** (`psm_core._low_coverage_columns`, <10% non-null) —
-     dataset-agnostic; catches e.g. bfar.csv's entirely-empty `CD: P_SCORE` /
-     `CV: PS_WT`.
-   - **Demographic/respondent-identity keyword match**
-     (`psm_core._context_excluded_columns`) — generic survey terms (age,
-     respondent, area, sex, marital status, education...), not tied to any one
-     program's naming scheme. Verified against bfar.csv's 215 raw columns: 5
-     exact matches, zero false positives. No separate "livelihood keyword"
-     allowlist needed — asset/income columns are named by specific item, not a
-     generic word, so they're kept by default.
-   - **Before/after wave-pair structural match**
-     (`psm_core._wave_pair_excluded_columns`) — a column that's the "current"
-     half of a pair sharing an identical name except for one isolated `A`/`B`
-     token (e.g. `D1.2:A_MOTORC` / `D1.2:B_MOTORC`). Confirmed against the
-     actual BFAR beneficiary questionnaire: Parts C/D/E/F/G each ask every item
-     twice ("before receiving the boat" / "at present" — a baseline/endline
-     design). A structural pattern match, not a hardcoded word list, so it
-     generalizes to other before/after-design surveys. 71 pairs detected on
-     bfar.csv, zero false positives. Known gap: a "current wave" column with no
-     "before" twin (bfar.csv's `C2:INCOME/B/FISH` etc.) isn't caught this way —
-     no generic signal indicates it's post-treatment; exclude it explicitly via
-     `exclude_columns`.
-   - **Leakage correlation with treatment**
-     (`psm_core._leakage_correlated_columns`, ≥0.95 correlation with
-     treatment's value or null-pattern) — a column whose null-pattern or raw
-     values correlate ≥0.95 with treatment is almost certainly a renamed copy of
-     the group assignment itself or a participant-only follow-up question, not
-     a genuine covariate. This is what catches bfar.csv's entire J-series
-     (boat-repair-specific follow-up, populated only for beneficiaries) and
-     `A2:GROUP` automatically.
-   `include_columns` (form field) exempts specific columns from the demographic
-   and wave-pair checks when the integrator knows better for their dataset; it
-   doesn't bypass low-coverage or leakage, which are correctness safeguards.
-   `exclude_columns` drops columns outright regardless of any filter's verdict.
-4. Fit a fresh `GradientBoostingClassifier` on every remaining ranked candidate
+3. Rank every numeric candidate column by importance for predicting treatment
+   (`psm_core.select_top_features`), excluding near-perfect treatment proxies
+   (`psm_core._leakage_correlated_columns` — a column whose null-pattern or raw
+   values correlate ≥0.95 with treatment is almost certainly a renamed copy of the
+   group assignment itself, not a genuine covariate).
+4. Fit a fresh `GradientBoostingClassifier` on every ranked candidate
    (`psm_core.train_psm_model`) -- no top-N cap; the full ranking is reported
    back so the integrator can trim it further if they want a smaller feature
    set for their own purposes.

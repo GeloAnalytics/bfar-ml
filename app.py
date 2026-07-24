@@ -94,10 +94,8 @@ STATE = {
     "rows": None,
     "trained_at": None,
     "trained_columns": None,
-    "exclusions": None,
+    "excluded_as_leakage": None,
     "dropped_for_rebalancing": None,
-    "manual_exclude_columns": None,
-    "manual_include_columns": None,
 }
 
 MIN_TRAINING_ROWS = 10
@@ -205,46 +203,23 @@ def test_ui():
 def train():
     """
     multipart/form-data:
-      file: <CSV file>                required
-      treatment_column: <col name>    optional -- bypasses auto-detection if
-                                       the heuristic picks the wrong column
-      exclude_columns: <comma-list>   optional -- drop these columns from
-                                       candidates outright, e.g. columns
-                                       known (for this specific dataset) to
-                                       be post-treatment or derived/circular
-      include_columns: <comma-list>   optional -- exempt these columns from
-                                       the demographic/wave-pair exclusion
-                                       (see below) even if they'd match
+      file: <CSV file>               required
+      treatment_column: <col name>   optional -- bypasses auto-detection if
+                                      the heuristic picks the wrong column
 
     If the uploaded CSV's column set exactly matches the columns of whatever
-    dataset last trained the active dynamic model, AND exclude_columns /
-    include_columns (if given) match what's already active, retraining is
-    skipped -- the existing model is reused as-is and just re-scored against
-    this upload. Anything else retrains from scratch, Teachable-Machine
+    dataset last trained the active dynamic model, retraining is skipped --
+    the existing model is reused as-is and just re-scored against this
+    upload. Any other column set retrains from scratch, Teachable-Machine
     style: auto-detects the treatment/control column (see
-    psm_core.detect_treatment_column), then ranks every usable candidate
-    column by importance for predicting it. Candidates are narrowed down
-    first, in order: (1) low data coverage in this upload
-    (psm_core._low_coverage_columns) -- dataset-agnostic; (2) a
-    demographic/respondent-identity keyword match in the column name
-    (psm_core._context_excluded_columns -- generic survey terms like age,
-    sex, area, education, not tied to any one program's naming scheme);
-    (3) a before/after wave-pair structural match
-    (psm_core._wave_pair_excluded_columns -- a column that's the "current"
-    half of a pair sharing an identical name except for an isolated A/B
-    token, e.g. bfar.csv's D1.2:A_MOTORC / D1.2:B_MOTORC; structural, not a
-    hardcoded word list, so it generalizes to other before/after-design
-    datasets); override checks 2-3 per-column via include_columns; (4)
-    near-perfect correlation with treatment
-    (psm_core._leakage_correlated_columns). Whatever survives all four gets
-    fit on in full -- no top-N cap (psm_core.select_top_features,
+    psm_core.detect_treatment_column), ranks every usable numeric column by
+    importance for predicting it (excluding near-perfect treatment proxies,
+    see psm_core._leakage_correlated_columns), and fits a fresh model on
+    every ranked candidate -- no top-N cap (psm_core.select_top_features,
     psm_core.train_psm_model). The full ranking ships in the response
     (feature_selection.selected / model_interpretation.feature_contributions)
-    so the integrator can curate it further downstream; this service doesn't
-    cut it down for you beyond the four filters above. Some columns need
-    exclude_columns explicitly -- e.g. a "current wave" measurement with no
-    "before" counterpart to structurally pair against has no generic signal
-    indicating it's post-treatment. If covariate balance isn't achieved (mean
+    so the integrator can curate the list further downstream; this service
+    doesn't cut it down for you. If covariate balance isn't achieved (mean
     |SMD| after matching >= 0.1, see psm_core.covariate_balance), the single
     worst-balanced feature is dropped and training retries, up to
     MAX_RETRAIN_ATTEMPTS times.
@@ -275,18 +250,13 @@ def train():
 
     uploaded_columns = sorted(df.columns)
     override_col = request.form.get("treatment_column") or None
-    manual_exclude_columns = sorted({c.strip() for c in request.form.get("exclude_columns", "").split(",") if c.strip()})
-    manual_include_columns = sorted({c.strip() for c in request.form.get("include_columns", "").split(",") if c.strip()})
     retrain_skipped = (
         STATE["model"] is not None
         and STATE.get("trained_columns") == uploaded_columns
         # An explicit override naming a *different* column than what's already
-        # active, or a change to the manual exclude/include lists, is a
-        # deliberate request to redo training under that configuration --
-        # honor it instead of silently reusing what's already active.
+        # active is a deliberate request to redo training under that column --
+        # honor it instead of silently reusing the old model's treatment column.
         and (override_col is None or override_col == STATE.get("treatment_col"))
-        and (not manual_exclude_columns or manual_exclude_columns == (STATE.get("manual_exclude_columns") or []))
-        and (not manual_include_columns or manual_include_columns == (STATE.get("manual_include_columns") or []))
     )
 
     if retrain_skipped:
@@ -301,7 +271,7 @@ def train():
         model = STATE["model"]
         top_features = STATE["feature_cols"]
         final_importances = STATE["importances"]
-        exclusions = STATE.get("exclusions") or {"leakage": [], "context": [], "wave_pair": [], "low_coverage": []}
+        excluded_leakage = STATE.get("excluded_as_leakage") or []
         dropped_for_rebalancing = STATE.get("dropped_for_rebalancing") or []
         retrain_attempts = 0
     else:
@@ -312,16 +282,15 @@ def train():
         if treatment_col is None:
             return jsonify({"error": "could not auto-detect a treatment/control column in this dataset; retry with a 'treatment_column' form field"}), 400
 
-        extra_exclude = set(manual_exclude_columns)
+        extra_exclude = set()
         dropped_for_rebalancing = []
-        model, top_features, final_importances, exclusions = None, None, None, None
+        model, top_features, final_importances, excluded_leakage = None, None, None, None
         balance = None
         for attempt in range(1, MAX_RETRAIN_ATTEMPTS + 1):
             retrain_attempts = attempt
             try:
-                top_features, final_importances, exclusions = core.select_top_features(
-                    df, treatment_col, treatment_binarized, top_n=TOP_N_FEATURES,
-                    extra_exclude=extra_exclude, force_include=manual_include_columns)
+                top_features, final_importances, excluded_leakage = core.select_top_features(
+                    df, treatment_col, treatment_binarized, top_n=TOP_N_FEATURES, extra_exclude=extra_exclude)
                 model, _ = core.train_psm_model(df, treatment_binarized, top_features)
             except ValueError as e:
                 return jsonify({"error": str(e)}), 400
@@ -343,10 +312,8 @@ def train():
             "rows": len(df),
             "trained_at": time.time(),
             "trained_columns": uploaded_columns,
-            "exclusions": exclusions,
+            "excluded_as_leakage": excluded_leakage,
             "dropped_for_rebalancing": dropped_for_rebalancing,
-            "manual_exclude_columns": manual_exclude_columns,
-            "manual_include_columns": manual_include_columns,
         })
         save_state()
 
@@ -368,13 +335,8 @@ def train():
         "feature_selection": {
             "n_features_selected": len(top_features),
             "selected": ranked_features,
-            "excluded_as_leakage": exclusions["leakage"],
-            "excluded_as_context": exclusions["context"],
-            "excluded_as_wave_pair": exclusions["wave_pair"],
-            "excluded_as_low_coverage": exclusions["low_coverage"],
+            "excluded_as_leakage": excluded_leakage,
             "dropped_for_rebalancing": dropped_for_rebalancing,
-            "manually_excluded": manual_exclude_columns,
-            "manually_included": manual_include_columns,
         },
         "ps_output": {
             "ps": [core.json_safe_float(v) for v in ps],
@@ -395,7 +357,7 @@ def train():
         # kept for backwards compatibility with existing callers
         "n_features_selected": len(top_features),
         "top_features": ranked_features,
-        "excluded_as_leakage": exclusions["leakage"],
+        "excluded_as_leakage": excluded_leakage,
     })
 
 

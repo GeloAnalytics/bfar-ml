@@ -54,7 +54,7 @@ currently active model. Identical → skip training entirely, reuse the existing
 against the new upload's rows regardless, since those describe *this* upload, not
 whether the model changed.
 
-### Feature selection — no cap, four exclusion filters
+### Feature selection — no cap
 
 1. Auto-detect the treatment/control column (`psm_core.detect_treatment_column`;
    override via `treatment_column` form field). `test_ui.html`'s train form exposes
@@ -64,53 +64,15 @@ whether the model changed.
    exact column name. Confirmed end-to-end: selecting a column other than the
    auto-detector's obvious pick still submits `treatment_column` and the response
    comes back with `treatment_detection_method: "manual_override"` for that column.
-2. Narrow the numeric, non-ID-like candidate columns down through four filters, in
-   order (each reported separately in `feature_selection`, see below):
-   a. **Low data coverage** (`psm_core._low_coverage_columns`) — fewer than 10%
-      non-null values in this upload. Fully dataset-agnostic; on bfar.csv this
-      catches `CD: P_SCORE` / `CV: PS_WT` (entirely empty) and `K:COMMENTS`
-      (almost entirely blank).
-   b. **Demographic/respondent-identity keyword match**
-      (`psm_core._context_excluded_columns`) — generic survey terms (age,
-      respondent, area, sex, marital status, education, ...), not tied to any one
-      program's naming scheme. Verified against bfar.csv's 215 raw columns: 5 exact
-      matches (`AREA`, `AGE`, `SEX`, `M-STATUS`, `EDUCATION`), zero false positives.
-      No separate "livelihood keyword" allowlist exists or is needed — asset/income
-      columns are named by specific item (motorcycle, TV, fridge...) rather than a
-      generic word, so they're retained simply by not matching this list.
-   c. **Before/after wave-pair structural match**
-      (`psm_core._wave_pair_excluded_columns`) — a column that's the "current" half
-      of a pair sharing an identical name except for one isolated `A`/`B` token
-      (e.g. `D1.2:A_MOTORC` / `D1.2:B_MOTORC`). Confirmed against the actual BFAR
-      beneficiary questionnaire: Parts C/D/E/F/G each ask every item twice — "BAGO
-      MATANGGAP ANG BANGKA" (before receiving the boat) / "SA KASALUKUYAN" (at
-      present) — a baseline/endline design. This is a *structural* pattern match
-      (does a same-named counterpart column exist with the token swapped?), not a
-      hardcoded word list, so it generalizes to other before/after-design datasets.
-      Verified: 71 pairs detected on bfar.csv, zero false positives (e.g.
-      `I2:A/C_M` — association/club membership — correctly left alone since no
-      `I2:B/C_M` counterpart exists). **Known gap:** some current-wave columns have
-      no "before" twin to pair against at all (bfar.csv's `C2:INCOME/B/FISH`,
-      `C4:INCOME/B/ALT`, `C5:TOT_INCOME/B` — current income, but the questionnaire
-      never asked a matching "before" breakdown by source) — no generic structural
-      signal can infer that; exclude those explicitly via `exclude_columns`.
-   d. **Leakage correlation with treatment** (`psm_core._leakage_correlated_columns`,
-      ≥0.95 correlation with treatment's value or null-pattern) — already existed
-      before this round of changes; this is what catches bfar.csv's entire J-series
-      (boat-repair-specific follow-up, populated only for beneficiaries) and
-      `A2:GROUP` automatically.
-   `include_columns` (form field) exempts specific columns from filters (b) and (c)
-   when the integrator knows better for their dataset; it does not bypass (a) or (d),
-   which are correctness safeguards rather than a stylistic default. `exclude_columns`
-   drops columns outright regardless of any filter's verdict.
-3. **Fit on every remaining ranked candidate — no top-N cutoff.** The full ranking is
+2. Rank every numeric, non-ID-like candidate column by importance for predicting
+   treatment (`psm_core.select_top_features`, a throwaway
+   `GradientBoostingClassifier`).
+3. Exclude near-perfect treatment proxies (`psm_core._leakage_correlated_columns`,
+   ≥0.95 correlation with treatment's value or null-pattern).
+4. **Fit on every remaining ranked candidate — no top-N cutoff.** The full ranking is
    reported in `feature_selection.selected` / `model_interpretation.feature_contributions`;
    curating that list down to a smaller working set is left to the integrator, not
    decided by this service.
-
-On the full 215-column `bfar.csv` (not just the 57-feature baseline subset), this
-narrows candidates to 104: 4 demographic, ~70 wave-pair, 3 low-coverage, ~29 leakage
-excluded.
 
 ### Covariate-balance re-tune loop (steps 5–7 of the pipeline diagram)
 
@@ -130,12 +92,8 @@ final, balanced or not (`retrain_attempts` reports how many were used).
 ### Persistence
 
 Model + feature set + treatment column + `trained_columns` (for the next call's
-retrain-skip check) + `exclusions` (dict with `leakage`/`context`/`wave_pair`/
-`low_coverage` lists) + `dropped_for_rebalancing` + `manual_exclude_columns` +
-`manual_include_columns` are all saved to `models/dynamic/` (`model.pkl` +
-`meta.json`) so a restart doesn't lose them. A change to `exclude_columns` /
-`include_columns` (like a `treatment_column` override) forces a full retrain even if
-the uploaded column set otherwise matches — see retrain-skip above.
+retrain-skip check) + `excluded_as_leakage` + `dropped_for_rebalancing` are all saved
+to `models/dynamic/` (`model.pkl` + `meta.json`) so a restart doesn't lose them.
 
 ## 4. `POST /train` response shape
 
@@ -151,12 +109,7 @@ the uploaded column set otherwise matches — see retrain-skip above.
     "n_features_selected": int,
     "selected": [{"feature": str, "importance": float}, ...],   # every ranked candidate, no cap
     "excluded_as_leakage": [str, ...],
-    "excluded_as_context": [str, ...],       # demographic keyword match
-    "excluded_as_wave_pair": [str, ...],     # "current" half of a before/after pair
-    "excluded_as_low_coverage": [str, ...],
-    "dropped_for_rebalancing": [str, ...],
-    "manually_excluded": [str, ...],         # echoes the exclude_columns form field
-    "manually_included": [str, ...]          # echoes the include_columns form field
+    "dropped_for_rebalancing": [str, ...]
   },
   "ps_output": {                     # step 6 — in-sample, on this upload
     "ps": [float, ...], "ps_logit": [float, ...],
