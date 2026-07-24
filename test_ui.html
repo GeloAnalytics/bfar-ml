@@ -14,6 +14,7 @@
   }
   h1 { font-size: 1.4rem; }
   h2 { font-size: 1.1rem; margin-top: 2.5rem; border-bottom: 1px solid #8884; padding-bottom: 0.3rem; }
+  h3 { font-size: 0.95rem; margin-top: 1.75rem; margin-bottom: 0.5rem; border-top: 1px dashed #8884; padding-top: 1rem; }
   .card {
     border: 1px solid #8884;
     border-radius: 8px;
@@ -88,12 +89,9 @@
   <button id="trainBtn">Train</button>
   <div id="trainStatus" class="status"></div>
   <pre id="trainOut">(no response yet)</pre>
-</div>
 
-<h2>2. Score a dataset against the current model</h2>
-<div class="card">
-  <label for="scoreFile">CSV file</label>
-  <input type="file" id="scoreFile" accept=".csv">
+  <h3>1b. Score this same dataset against the current model</h3>
+  <p class="muted">Reuses the CSV file picked above -- no need to upload it again.</p>
   <button id="scoreBtn">Score (predict_ps_batch)</button>
   <div id="scoreStatus" class="status"></div>
   <pre id="scoreOut">(no response yet)</pre>
@@ -192,7 +190,7 @@ document.getElementById("trainBtn").addEventListener("click", async () => {
 });
 
 document.getElementById("scoreBtn").addEventListener("click", async () => {
-  const fileInput = document.getElementById("scoreFile");
+  const fileInput = document.getElementById("trainFile");
   const status = document.getElementById("scoreStatus");
   const out = document.getElementById("scoreOut");
 
