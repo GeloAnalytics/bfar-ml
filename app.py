@@ -3,6 +3,7 @@ from flask_cors import CORS
 from dotenv import load_dotenv
 import os
 import json
+import socket
 import threading
 import time
 
@@ -672,6 +673,23 @@ def static_health():
     return jsonify(response)
 
 
+def _wait_for_port(check_host, check_port, timeout=10):
+    """Werkzeug's own startup banner doesn't reliably reach the console when
+    printed from a background thread on every platform/terminal (seen on
+    Windows PowerShell: the static app's "Running on..." lines sometimes
+    never appear even though it's genuinely up). Poll the socket instead of
+    trusting print output, so the confirmation below is always accurate."""
+    probe_host = "127.0.0.1" if check_host == "0.0.0.0" else check_host
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            with socket.create_connection((probe_host, check_port), timeout=0.5):
+                return True
+        except OSError:
+            time.sleep(0.1)
+    return False
+
+
 if __name__ == "__main__":
     host = os.environ.get("HOST", "0.0.0.0")
     port = int(os.environ.get("PORT", "8000"))
@@ -684,4 +702,10 @@ if __name__ == "__main__":
     )
     static_thread.start()
 
+    if _wait_for_port(static_host, static_port):
+        print(f" * Static app confirmed listening on http://{static_host}:{static_port}", flush=True)
+    else:
+        print(f" * WARNING: static app did not come up on port {static_port} within 10s -- check for a port conflict", flush=True)
+
+    print(f" * Starting dynamic app on http://{host}:{port} (blocking here; Ctrl+C stops both)", flush=True)
     app.run(host=host, port=port, debug=False)
