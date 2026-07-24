@@ -255,9 +255,13 @@ def train():
 
     if retrain_skipped:
         try:
-            treatment_col, treatment_binarized, method = core.detect_treatment_column(df, override_col=STATE["treatment_col"])
+            treatment_col, treatment_binarized, _ = core.detect_treatment_column(df, override_col=STATE["treatment_col"])
         except ValueError as e:
             return jsonify({"error": str(e)}), 400
+        # Re-binarizing via override_col always reports "manual_override" -- report
+        # how the column was *actually* found when the active model was trained,
+        # not an artifact of how we're re-deriving the binarized series here.
+        method = STATE["treatment_method"]
         model = STATE["model"]
         top_features = STATE["feature_cols"]
         final_importances = STATE["importances"]
