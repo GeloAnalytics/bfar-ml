@@ -73,12 +73,22 @@ model. Any column added, removed, or renamed forces a full retrain.
    set for their own purposes.
 5. **Check covariate balance** (`psm_core.covariate_balance`): 1-NN caliper-matches
    treated to control on the fitted model's propensity score, computes standardized
-   mean difference per selected feature before/after matching. If the mean |SMD after
-   matching| is `>= 0.1`, the single worst-balanced feature is dropped and steps 3–5
-   repeat, up to 3 attempts total (`MAX_RETRAIN_ATTEMPTS` in `app.py`) — whichever
-   attempt's result is used, balanced or not, becomes final; the response's
-   `retrain_attempts` and `feature_selection.dropped_for_rebalancing` show what
-   happened.
+   mean difference per selected feature before/after matching. The verdict is
+   **count-based, not a mean threshold**: balanced if no more than
+   `MAX_UNBALANCED_FEATURE_PCT` (20%) of features individually have |SMD after
+   matching| `>= 0.1` -- not "the average across every feature must be low." An earlier
+   version required the mean to be under 0.1, which turned out to fail almost every
+   real dataset with 50+ covariates (a couple of genuinely different features drags the
+   average up even when most features match well). Mirrors a reference PSM notebook's
+   Cell 9 IPW balance check (tolerates up to 10 of 57 features, ~17.5%), expressed as a
+   percentage so it scales with feature count. If not balanced, the single
+   worst-balanced feature is dropped and steps 3–5 repeat, up to 3 attempts total
+   (`MAX_RETRAIN_ATTEMPTS` in `app.py`) — whichever attempt's result is used, balanced
+   or not, becomes final; the response's `retrain_attempts` and
+   `feature_selection.dropped_for_rebalancing` show what happened, and
+   `covariate_balance.n_features_over_threshold` /
+   `covariate_balance.max_unbalanced_features_allowed` show exactly how close (or far)
+   the final attempt came.
 6. Overwrite whatever was in the dynamic model slot, and persist it (plus
    `trained_columns`, for the next call's retrain-skip check) to `models/dynamic/` so
    a process restart doesn't lose it.

@@ -451,7 +451,17 @@ def matched_att(ps_logit_final, treatments, outcomes, caliper_ratio=0.2, n_boots
     }, None
 
 
-BALANCE_THRESHOLD = 0.1  # standard "well-balanced" cutoff for |SMD| in the PSM literature
+BALANCE_THRESHOLD = 0.1  # standard "well-balanced" cutoff for a single feature's |SMD|
+# Count-based tolerance, not a mean-based gate: up to this fraction of features may
+# individually exceed BALANCE_THRESHOLD and the model is still called "balanced"
+# overall. Requiring the *average* |SMD| across every candidate to be low is
+# unrealistically strict once a dataset has 50-100+ real socioeconomic covariates --
+# a handful of genuinely different features drags the mean up and fails the whole
+# model even when the vast majority are well-matched. Mirrors the reference PSM
+# notebook's Cell 9 IPW balance check (tolerates up to 10 of 57 features, ~17.5%,
+# rather than an aggregate mean threshold) -- expressed as a percentage here so it
+# scales with however many features this dataset's dynamic model actually selected.
+MAX_UNBALANCED_FEATURE_PCT = 0.20
 
 
 def standardized_mean_diff(X, treatments):
@@ -474,20 +484,33 @@ def standardized_mean_diff(X, treatments):
     return smd
 
 
-def covariate_balance(df, treatment_binarized, feature_cols, ps_logit, caliper_ratio=0.2, balance_threshold=BALANCE_THRESHOLD):
+def _unbalanced_feature_verdict(abs_smd, n_features, max_unbalanced_pct):
+    """Count-based balance verdict: how many features individually exceed
+    BALANCE_THRESHOLD, and is that count within the tolerated cap. See
+    MAX_UNBALANCED_FEATURE_PCT above for why this replaced a mean-based gate."""
+    n_over = int(np.sum(abs_smd > BALANCE_THRESHOLD))
+    max_allowed = max(1, int(np.ceil(n_features * max_unbalanced_pct)))
+    return n_over, max_allowed
+
+
+def covariate_balance(df, treatment_binarized, feature_cols, ps_logit, caliper_ratio=0.2,
+                       balance_threshold=BALANCE_THRESHOLD, max_unbalanced_pct=MAX_UNBALANCED_FEATURE_PCT):
     """
     Covariate balance diagnostics (pipeline step 7): standardized mean difference per
     feature before and after 1-NN caliper matching (see _match_pairs), PS common-support
-    overlap between groups, and a balance_achieved verdict (mean |SMD after matching| <
-    balance_threshold -- falls back to pre-match SMD if no pairs matched). Also reports
-    the single worst-balanced feature, for a caller that wants to drop it and retry
-    (see app.py's /train re-tune loop).
+    overlap between groups, and a balance_achieved verdict -- count-based, not a mean
+    threshold: true if no more than `max_unbalanced_pct` of features individually have
+    |SMD after matching| >= balance_threshold (falls back to pre-match SMD if no pairs
+    matched). Also reports the single worst-balanced feature, for a caller that wants
+    to drop it and retry (see app.py's /train re-tune loop).
     """
     treatments = treatment_binarized.to_numpy()
     if (treatments == 0).sum() == 0 or (treatments == 1).sum() == 0:
         return {
             "balance_achieved": False,
             "mean_abs_smd": None,
+            "n_features_over_threshold": None,
+            "max_unbalanced_features_allowed": None,
             "balance_threshold": balance_threshold,
             "matched_pairs": 0,
             "caliper": None,
@@ -509,9 +532,12 @@ def covariate_balance(df, treatment_binarized, feature_cols, ps_logit, caliper_r
         ]
         mean_abs_smd = float(np.mean(np.abs(pre_smd))) if len(pre_smd) else None
         worst_idx = int(np.argmax(np.abs(pre_smd))) if len(pre_smd) else None
+        n_over, max_allowed = _unbalanced_feature_verdict(np.abs(pre_smd), len(feature_cols), max_unbalanced_pct)
         return {
-            "balance_achieved": mean_abs_smd is not None and mean_abs_smd < balance_threshold,
+            "balance_achieved": mean_abs_smd is not None and n_over <= max_allowed,
             "mean_abs_smd": json_safe_float(mean_abs_smd) if mean_abs_smd is not None else None,
+            "n_features_over_threshold": n_over,
+            "max_unbalanced_features_allowed": max_allowed,
             "balance_threshold": balance_threshold,
             "matched_pairs": 0,
             "caliper": json_safe_float(caliper) if caliper is not None else None,
@@ -533,6 +559,7 @@ def covariate_balance(df, treatment_binarized, feature_cols, ps_logit, caliper_r
     abs_post = np.abs(post_smd)
     worst_idx = int(np.argmax(abs_post))
     mean_abs_smd = float(np.mean(abs_post))
+    n_over, max_allowed = _unbalanced_feature_verdict(abs_post, len(feature_cols), max_unbalanced_pct)
 
     control_ps = ps_logit[treatments == 0]
     treat_ps = ps_logit[treatments == 1]
@@ -544,8 +571,10 @@ def covariate_balance(df, treatment_binarized, feature_cols, ps_logit, caliper_r
     }
 
     return {
-        "balance_achieved": mean_abs_smd < balance_threshold,
+        "balance_achieved": n_over <= max_allowed,
         "mean_abs_smd": json_safe_float(mean_abs_smd),
+        "n_features_over_threshold": n_over,
+        "max_unbalanced_features_allowed": max_allowed,
         "balance_threshold": balance_threshold,
         "matched_pairs": int(len(matched_pairs)),
         "caliper": json_safe_float(caliper),

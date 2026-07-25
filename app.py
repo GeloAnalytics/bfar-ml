@@ -219,10 +219,11 @@ def train():
     psm_core.train_psm_model). The full ranking ships in the response
     (feature_selection.selected / model_interpretation.feature_contributions)
     so the integrator can curate the list further downstream; this service
-    doesn't cut it down for you. If covariate balance isn't achieved (mean
-    |SMD| after matching >= 0.1, see psm_core.covariate_balance), the single
-    worst-balanced feature is dropped and training retries, up to
-    MAX_RETRAIN_ATTEMPTS times.
+    doesn't cut it down for you. If covariate balance isn't achieved (more
+    than MAX_UNBALANCED_FEATURE_PCT of features individually have |SMD| after
+    matching >= 0.1 -- a count-based tolerance, not a mean-based gate, see
+    psm_core.covariate_balance), the single worst-balanced feature is dropped
+    and training retries, up to MAX_RETRAIN_ATTEMPTS times.
 
     Response includes, alongside the trained-model summary: feature_selection
     (selected features + what got excluded and why), ps_output (in-sample
