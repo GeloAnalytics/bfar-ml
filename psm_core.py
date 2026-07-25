@@ -300,19 +300,27 @@ def compute_shap_feature_contributions(model, X, feature_cols):
 
 def generate_socioeconomic_insights(feature_contributions, top_n=5):
     """
-    Plain-language summary of the top `top_n` SHAP-ranked features --
-    generic template sentences built from whatever column names this
-    dataset provides. No hardcoded knowledge of what a given column means;
-    this doesn't tie the wording to bfar.csv or any one program.
+    Plain-language summary of the top `top_n` SHAP-ranked *columns* -- generic
+    template sentences built from whatever column names this dataset
+    provides. No hardcoded knowledge of what a given column means; this
+    doesn't tie the wording to bfar.csv or any one program.
+
+    This ranks INPUT FEATURES (columns), not rows/respondents, and has
+    nothing to do with how many propensity scores exist -- that count always
+    equals the number of rows in the upload (see ps_output), completely
+    independent of how many features were ranked here or how large `top_n`
+    is. Each sentence below states its rank explicitly (e.g. "feature #2 of
+    5 shown") to keep that distinction unambiguous in the response.
     """
     insights = []
     for rank, contrib in enumerate(feature_contributions[:top_n], start=1):
         direction_phrase = "a higher" if contrib["direction"] == "increases_likelihood" else "a lower"
-        rank_phrase = "the strongest" if rank == 1 else f"the {_ordinal(rank)}-strongest"
         insights.append(
-            f"\"{contrib['feature']}\" is {rank_phrase} factor distinguishing participants from "
-            f"non-participants in this dataset -- higher values of this feature are associated with "
-            f"{direction_phrase} likelihood of being in the treatment group."
+            f"Feature #{rank} of {min(top_n, len(feature_contributions))} shown (ranked by SHAP "
+            f"contribution to the propensity-score model, out of {len(feature_contributions)} "
+            f"features total) -- column \"{contrib['feature']}\": higher values in this column are "
+            f"associated with {direction_phrase} likelihood of being in the treatment group. "
+            f"(This describes one input column, not an individual respondent.)"
         )
     return insights
 
