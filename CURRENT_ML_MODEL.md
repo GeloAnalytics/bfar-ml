@@ -116,17 +116,18 @@ After fitting, `psm_core.covariate_balance`:
 - Computes standardized mean difference (SMD) per selected feature, before and after
   matching.
 - Computes PS common-support overlap between groups.
-- Verdict: **count-based, not mean-based.** `balance_achieved` = true if no more than
-  `MAX_UNBALANCED_FEATURE_PCT` (35%) of features individually have |SMD after matching|
-  `>= 0.1` (falls back to pre-match SMD if no pairs matched). Reports
-  `n_features_over_threshold` and `max_unbalanced_features_allowed` alongside the
-  informational `mean_abs_smd`. Requiring the *average* SMD across every candidate to
-  be low turned out to be unrealistically strict once a dataset has 50-100+ real
-  socioeconomic covariates -- a handful of genuinely different features drags the mean
-  up and fails the whole model even when most features are well-matched. Mirrors the
-  reference PSM notebook's Cell 9 IPW balance check (tolerates up to 10 of 57 features,
-  ~17.5%, rather than an aggregate mean threshold), expressed as a percentage so it
-  scales with however many features a given dynamic model actually selected.
+- Verdict: **count-based, not mean-based.** `balance_achieved` = true if either the
+  matched-pairs check or the IPW reweighted check stays within the same
+  `MAX_UNBALANCED_FEATURE_PCT` (35%) cap on features individually having |SMD| `>=
+  0.1`. The matched-pairs verdict is still reported as `matched_balance_achieved`; the
+  IPW verdict lives under `ipw.balance_achieved`. Requiring the *average* SMD across
+  every candidate to be low turned out to be unrealistically strict once a dataset has
+  50-100+ real socioeconomic covariates -- a handful of genuinely different features
+  drags the mean up and fails the whole model even when most features are well-matched.
+  Mirrors the reference PSM notebook's Cell 9 IPW balance check (tolerates up to 10 of
+  57 features, ~17.5%, rather than an aggregate mean threshold), expressed as a
+  percentage so it scales with however many features a given dynamic model actually
+  selected.
 
 If not achieved, the model is refit on progressively smaller top-ranked subsets
 (`BALANCE_SHRINK_FACTOR`, with a `MIN_BALANCE_FEATURES` floor), up to `MAX_RETRAIN_ATTEMPTS`

@@ -84,7 +84,7 @@ except Exception as e:
 STATE_DIR = os.environ.get("ML_DYNAMIC_STATE_DIR", os.path.join(os.path.dirname(__file__), "models", "dynamic"))
 STATE_MODEL_PATH = os.path.join(STATE_DIR, "model.pkl")
 STATE_META_PATH = os.path.join(STATE_DIR, "meta.json")
-DYNAMIC_TRAINING_VERSION = 2
+DYNAMIC_TRAINING_VERSION = 3
 
 STATE = {
     "model": None,
@@ -253,12 +253,12 @@ def train():
     matching >= 0.1 -- a count-based tolerance, not a mean-based gate, see
     psm_core.covariate_balance), training retries on progressively fewer
     top-ranked features (BALANCE_SHRINK_FACTOR-decayed, floor
-    MIN_BALANCE_FEATURES) until balance is achieved or MAX_RETRAIN_ATTEMPTS
-    runs out -- matching only guarantees balance on the scalar propensity
-    score, not on every individual covariate, so a large candidate set is
-    genuinely harder to balance regardless of tolerance; shrinking the set is
-    what actually fixes it. feature_selection.dropped_for_rebalancing lists
-    whatever didn't make the final, balance-achieving cut.
+    MIN_BALANCE_FEATURES) only if neither the matched-pairs check nor the IPW
+    reweighted check reaches balance. Matching only guarantees balance on the
+    scalar propensity score, not on every individual covariate, so the IPW
+    pass gets a chance to accept a much larger feature set before shrinking the
+    model further. feature_selection.dropped_for_rebalancing lists whatever
+    didn't make the final, balance-achieving cut.
 
     Response includes, alongside the trained-model summary: feature_selection
     (selected features + what got excluded and why), ps_output (in-sample

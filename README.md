@@ -222,6 +222,7 @@ is expected, not a bug.
   },
   "covariate_balance": {
     "balance_achieved": true,
+    "matched_balance_achieved": false,
     "mean_abs_smd": 0.061,
     "n_features_over_threshold": 2,
     "max_unbalanced_features_allowed": 6,
@@ -230,7 +231,8 @@ is expected, not a bug.
     "caliper": 0.24,
     "overlap": {"treated_in_control_range_pct": 96.1, "control_in_treated_range_pct": 91.4},
     "per_feature": [{"feature": "monthly_income", "smd_before": 0.34, "smd_after": 0.05}, "..."],
-    "worst_feature": "household_size"
+    "worst_feature": "household_size",
+    "ipw": {"balance_achieved": true, "mean_abs_smd": 0.04, "n_features_over_threshold": 1, "max_unbalanced_features_allowed": 6, "trimmed_n": 398}
   },
   "model_interpretation": {
     "method": "SHAP (shap.TreeExplainer, exact for tree-ensemble models) ...",
@@ -248,8 +250,12 @@ is expected, not a bug.
 ```
 `covariate_balance` (pipeline step 7) reports standardized mean difference per feature
 before/after 1-NN caliper matching, propensity-score common-support overlap between
-groups, and a `balance_achieved` verdict -- **count-based**: true if no more than 35%
-of features (`max_unbalanced_features_allowed`) individually exceed |SMD| `>= 0.1`
+groups, and a `balance_achieved` verdict. That verdict is now overall: it can pass if
+either the matched-pairs check or the IPW reweighted check clears the same
+count-based bar. The matched-pairs result is still reported separately as
+`matched_balance_achieved`, and the IPW result lives under `covariate_balance.ipw`.
+The count-based bar is true if no more than 35% of features
+(`max_unbalanced_features_allowed`) individually exceed |SMD| `>= 0.1`
 (`n_features_over_threshold`), not a requirement that the *average* across every
 feature stays low -- `psm_core.covariate_balance`. `model_interpretation` (step 9) is real SHAP values
 (`psm_core.compute_shap_feature_contributions`, `shap.TreeExplainer` -- exact for tree

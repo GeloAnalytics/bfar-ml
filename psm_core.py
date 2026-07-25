@@ -656,6 +656,11 @@ def _unbalanced_feature_verdict(abs_smd, n_features, max_unbalanced_pct):
     return n_over, max_allowed
 
 
+def _balance_achieved_from_abs_smd(abs_smd, n_features, max_unbalanced_pct):
+    n_over, max_allowed = _unbalanced_feature_verdict(abs_smd, n_features, max_unbalanced_pct)
+    return n_over <= max_allowed, n_over, max_allowed
+
+
 def covariate_balance(df, treatment_binarized, feature_cols, ps_logit, caliper_ratio=0.2,
                        balance_threshold=BALANCE_THRESHOLD, max_unbalanced_pct=MAX_UNBALANCED_FEATURE_PCT):
     """
@@ -684,6 +689,7 @@ def covariate_balance(df, treatment_binarized, feature_cols, ps_logit, caliper_r
     if (treatments == 0).sum() == 0 or (treatments == 1).sum() == 0:
         return {
             "balance_achieved": False,
+            "matched_balance_achieved": False,
             "mean_abs_smd": None,
             "n_features_over_threshold": None,
             "max_unbalanced_features_allowed": None,
@@ -693,7 +699,7 @@ def covariate_balance(df, treatment_binarized, feature_cols, ps_logit, caliper_r
             "overlap": {"treated_in_control_range_pct": None, "control_in_treated_range_pct": None},
             "per_feature": [],
             "worst_feature": None,
-            "ipw": {"mean_abs_smd": None, "n_features_over_threshold": None, "trimmed_n": 0},
+            "ipw": {"balance_achieved": False, "mean_abs_smd": None, "n_features_over_threshold": None, "trimmed_n": 0},
             "error": "need both treated and control records to assess balance",
         }
 
@@ -707,9 +713,14 @@ def covariate_balance(df, treatment_binarized, feature_cols, ps_logit, caliper_r
     else:
         ipw_smd = np.full(len(feature_cols), np.nan)
     finite_abs_ipw = np.abs(ipw_smd)[np.isfinite(ipw_smd)]
+    ipw_achieved, ipw_n_over, ipw_max_allowed = _balance_achieved_from_abs_smd(
+        finite_abs_ipw, len(feature_cols), max_unbalanced_pct
+    ) if len(finite_abs_ipw) else (False, None, None)
     ipw_summary = {
         "mean_abs_smd": json_safe_float(float(np.mean(finite_abs_ipw))) if len(finite_abs_ipw) else None,
-        "n_features_over_threshold": int(np.sum(finite_abs_ipw > balance_threshold)) if len(finite_abs_ipw) else None,
+        "n_features_over_threshold": ipw_n_over,
+        "max_unbalanced_features_allowed": ipw_max_allowed,
+        "balance_achieved": ipw_achieved,
         "trimmed_n": int(ipw_mask.sum()),
     }
 
@@ -722,9 +733,10 @@ def covariate_balance(df, treatment_binarized, feature_cols, ps_logit, caliper_r
         ]
         mean_abs_smd = float(np.mean(np.abs(pre_smd))) if len(pre_smd) else None
         worst_idx = int(np.argmax(np.abs(pre_smd))) if len(pre_smd) else None
-        n_over, max_allowed = _unbalanced_feature_verdict(np.abs(pre_smd), len(feature_cols), max_unbalanced_pct)
+        matched_achieved, n_over, max_allowed = _balance_achieved_from_abs_smd(np.abs(pre_smd), len(feature_cols), max_unbalanced_pct)
         return {
-            "balance_achieved": mean_abs_smd is not None and n_over <= max_allowed,
+            "balance_achieved": matched_achieved or ipw_achieved,
+            "matched_balance_achieved": matched_achieved,
             "mean_abs_smd": json_safe_float(mean_abs_smd) if mean_abs_smd is not None else None,
             "n_features_over_threshold": n_over,
             "max_unbalanced_features_allowed": max_allowed,
@@ -750,7 +762,7 @@ def covariate_balance(df, treatment_binarized, feature_cols, ps_logit, caliper_r
     abs_post = np.abs(post_smd)
     worst_idx = int(np.argmax(abs_post))
     mean_abs_smd = float(np.mean(abs_post))
-    n_over, max_allowed = _unbalanced_feature_verdict(abs_post, len(feature_cols), max_unbalanced_pct)
+    matched_achieved, n_over, max_allowed = _balance_achieved_from_abs_smd(abs_post, len(feature_cols), max_unbalanced_pct)
 
     control_ps = ps_logit[treatments == 0]
     treat_ps = ps_logit[treatments == 1]
@@ -762,7 +774,8 @@ def covariate_balance(df, treatment_binarized, feature_cols, ps_logit, caliper_r
     }
 
     return {
-        "balance_achieved": n_over <= max_allowed,
+        "balance_achieved": matched_achieved or ipw_achieved,
+        "matched_balance_achieved": matched_achieved,
         "mean_abs_smd": json_safe_float(mean_abs_smd),
         "n_features_over_threshold": n_over,
         "max_unbalanced_features_allowed": max_allowed,
