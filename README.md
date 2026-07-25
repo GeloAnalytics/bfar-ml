@@ -16,7 +16,7 @@ app in a background thread, started together by `python app.py`:
 The dynamic model works **Teachable-Machine style**: every `POST /train` call with a
 new column set deletes whatever model is currently active and trains a completely
 fresh one on the new upload -- ranking every usable column by feature importance and
-fitting on all of them, no top-N cap and no merging with the previous schema. Before
+fitting on all of them on the first attempt, no top-N cap and no merging with the previous schema. Before
 ranking, candidates are narrowed by three filters (each reported separately in
 `feature_selection`): a demographic/respondent-identity keyword match (generic survey
 terms like age, sex, area, education -- not tied to any one program's naming scheme;
@@ -26,18 +26,17 @@ half of a pair sharing an identical name except for one A/B token -- confirmed a
 the actual BFAR beneficiary questionnaire's baseline/endline design; a structural
 pattern, not a hardcoded word list, so it generalizes across similar before/after
 survey designs), and leakage correlation with treatment. The full ranking of what
-survives ships in the response (`feature_selection.selected`); curating that list down
-further is left to the integrator, not this service. If the uploaded CSV's columns
+survives is used as the starting point for the balance loop. If the uploaded CSV's columns
 exactly match the columns of whatever dataset trained the currently active model,
 training is skipped entirely and the existing model is reused as-is (`retrained: false`
 in the response) -- only re-scored against the new upload. See `DYNAMIC_TRAINING.md`
 for the full design and why this replaced an earlier
 index-mapping approach.
 
-If covariate balance isn't achieved after fitting -- more than 20% of features
+If covariate balance isn't achieved after fitting -- more than 35% of features
 individually have |SMD| across matched pairs `>= 0.1` (count-based, not a mean
-threshold across all features) -- `/train` automatically drops the single
-worst-balanced feature and retries, up to 3 attempts, before finalizing -- see
+threshold across all features) -- `/train` automatically retries on progressively
+smaller top-ranked feature sets, down to at least 5 features or up to 15 attempts, before finalizing -- see
 `covariate_balance` in the response and `psm_core.covariate_balance`.
 
 Both always start together (one process, `python app.py`) -- there's no flag to run
@@ -185,11 +184,12 @@ column by importance for predicting the detected treatment column, after excludi
 (1) demographic/respondent-identity columns (a generic keyword match -- age, sex,
 area, education, etc.), (2) before/after wave-pair columns (a column that's the
 "current" half of a pair sharing an identical name except for one A/B token), and (3)
-near-perfect treatment proxies, then fits on **all** that remain -- no top-N cap; the
-full ranking ships back in `feature_selection.selected` and it's on the integrator to
-curate that list further if they want a smaller feature set. If covariate balance
-isn't achieved, drops the single worst-balanced feature and retries (up to 3 attempts
-total, see `retrain_attempts`). Nothing carries over from any previous `/train` call
+near-perfect treatment proxies, then fits on **all** that remain on the first attempt
+-- no top-N cap. If covariate balance isn't achieved, it retries on progressively
+smaller top-ranked feature sets until balance is achieved, it reaches 5 features, or
+15 attempts have run (see `retrain_attempts`). `feature_selection.selected` reports
+the final selected feature set, and `feature_selection.dropped_for_rebalancing`
+reports features pruned by that balance search. Nothing carries over from any previous `/train` call
 that actually retrained.
 
 **Two independent counts, don't confuse them:** `rows` / `ps_output.n_rows_scored` is
@@ -248,7 +248,7 @@ is expected, not a bug.
 ```
 `covariate_balance` (pipeline step 7) reports standardized mean difference per feature
 before/after 1-NN caliper matching, propensity-score common-support overlap between
-groups, and a `balance_achieved` verdict -- **count-based**: true if no more than 20%
+groups, and a `balance_achieved` verdict -- **count-based**: true if no more than 35%
 of features (`max_unbalanced_features_allowed`) individually exceed |SMD| `>= 0.1`
 (`n_features_over_threshold`), not a requirement that the *average* across every
 feature stays low -- `psm_core.covariate_balance`. `model_interpretation` (step 9) is real SHAP values

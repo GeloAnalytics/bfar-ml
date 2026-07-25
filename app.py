@@ -3,6 +3,7 @@ from flask_cors import CORS
 from dotenv import load_dotenv
 import os
 import json
+import math
 import socket
 import threading
 import time
@@ -83,9 +84,11 @@ except Exception as e:
 STATE_DIR = os.environ.get("ML_DYNAMIC_STATE_DIR", os.path.join(os.path.dirname(__file__), "models", "dynamic"))
 STATE_MODEL_PATH = os.path.join(STATE_DIR, "model.pkl")
 STATE_META_PATH = os.path.join(STATE_DIR, "meta.json")
+DYNAMIC_TRAINING_VERSION = 2
 
 STATE = {
     "model": None,
+    "training_version": None,
     "feature_cols": None,
     "importances": None,
     "treatment_col": None,
@@ -97,20 +100,32 @@ STATE = {
     "excluded_as_leakage": None,
     "excluded_as_wave_pair": None,
     "excluded_as_context": None,
+    "excluded_as_low_coverage": None,
     "dropped_for_rebalancing": None,
 }
 
 MIN_TRAINING_ROWS = 10
-# No cap on selected features -- every non-leakage-correlated numeric candidate
-# column is ranked, used to fit the model, and reported with its importance.
-# Curating that list down further is left to the integrator, not this service.
+# First attempt ranks and fits on every non-leakage-correlated numeric candidate
+# column, no cap. If that doesn't reach covariate balance, subsequent attempts
+# shrink to progressively fewer top-ranked features (see BALANCE_SHRINK_FACTOR
+# below) rather than trying the full set every time.
 TOP_N_FEATURES = None
-# How many drop-worst-feature-and-retry rounds covariate_balance gets before /train
-# gives up and ships the model as-is. 10 mirrors the reference PSM notebook's own
-# tolerated count of unbalanced features (Cell 9: warns past 10 of 57) -- enough
-# rounds to actually prune down to genuine balance on most datasets, rather than the
-# old cap of 3, which routinely gave up while balance_achieved was still false.
-MAX_RETRAIN_ATTEMPTS = 10
+# On a failed balance check, the next attempt re-ranks and keeps only the top
+# ceil(current_feature_count * BALANCE_SHRINK_FACTOR) features (floor
+# MIN_BALANCE_FEATURES), then re-fits and re-checks -- exponential-decay search
+# for the smallest-necessary covariate set that actually reaches genuine balance,
+# rather than a fixed magic number tuned to one dataset. Matching only guarantees
+# balance on the scalar propensity score, not on every individual covariate it
+# was built from -- with 100+ candidate columns and a four-figure row count,
+# empirically most of them stay individually unbalanced after matching no matter
+# how loose the tolerance is (verified against bfar.csv: 65-74 of ~104 features
+# stay over threshold at any tolerance), so cutting dimensionality is what
+# actually fixes it, not a looser bar. 0.7 (30% cut per failed attempt) converges
+# bfar.csv to genuine balance in ~9 attempts (104 -> 7 features); MAX_RETRAIN_ATTEMPTS
+# below gives headroom for larger candidate sets on other datasets.
+BALANCE_SHRINK_FACTOR = 0.7
+MIN_BALANCE_FEATURES = 5
+MAX_RETRAIN_ATTEMPTS = 15
 
 
 def load_state():
@@ -158,7 +173,7 @@ def _score(source, model, feature_cols, scaler, df):
         X_input = scaler.transform(X) if core.model_needs_scaling(model) else X
     else:
         X = df[feature_cols].fillna(0)
-        X_input = X
+        X_input = X.to_numpy(dtype=float)
     ps = model.predict_proba(X_input)[:, 1]
     return ps, X
 
@@ -230,21 +245,28 @@ def train():
     hardcoded word list, so it generalizes to other before/after-design
     datasets, not just bfar.csv; (3) near-perfect correlation with treatment
     (psm_core._leakage_correlated_columns). Whatever survives all three gets
-    ranked by importance and fit on in full -- no top-N cap
-    (psm_core.select_top_features, psm_core.train_psm_model). The full
-    ranking ships in the response (feature_selection.selected /
-    model_interpretation.feature_contributions) so the integrator can curate
-    the list further downstream; this service doesn't cut it down for you
-    beyond the three filters above. If covariate balance isn't achieved (more
-    than MAX_UNBALANCED_FEATURE_PCT of features individually have |SMD| after
+    ranked by importance and fit on in full on the first attempt -- no top-N
+    cap (psm_core.select_top_features, psm_core.train_psm_model). The final
+    selected feature set ships in the response (feature_selection.selected /
+    model_interpretation.feature_contributions). If covariate balance isn't achieved (more than
+    MAX_UNBALANCED_FEATURE_PCT of features individually have |SMD| after
     matching >= 0.1 -- a count-based tolerance, not a mean-based gate, see
-    psm_core.covariate_balance), the single worst-balanced feature is dropped
-    and training retries, up to MAX_RETRAIN_ATTEMPTS times.
+    psm_core.covariate_balance), training retries on progressively fewer
+    top-ranked features (BALANCE_SHRINK_FACTOR-decayed, floor
+    MIN_BALANCE_FEATURES) until balance is achieved or MAX_RETRAIN_ATTEMPTS
+    runs out -- matching only guarantees balance on the scalar propensity
+    score, not on every individual covariate, so a large candidate set is
+    genuinely harder to balance regardless of tolerance; shrinking the set is
+    what actually fixes it. feature_selection.dropped_for_rebalancing lists
+    whatever didn't make the final, balance-achieving cut.
 
     Response includes, alongside the trained-model summary: feature_selection
     (selected features + what got excluded and why), ps_output (in-sample
     propensity scores for this upload), covariate_balance (SMD before/after
-    matching, PS overlap, balance_achieved verdict), model_interpretation
+    matching, PS overlap, balance_achieved verdict, plus an `ipw` block --
+    the same balance reweighted across the whole sample instead of restricted
+    to matched pairs, reported for context only, does not affect
+    balance_achieved -- see psm_core.covariate_balance), model_interpretation
     (real SHAP values via shap.TreeExplainer -- mean |SHAP value| per feature
     plus plain-language socioeconomic_insights), and decision_support
     (PS-quartile table).
@@ -270,6 +292,7 @@ def train():
     override_col = request.form.get("treatment_column") or None
     retrain_skipped = (
         STATE["model"] is not None
+        and STATE.get("training_version") == DYNAMIC_TRAINING_VERSION
         and STATE.get("trained_columns") == uploaded_columns
         # An explicit override naming a *different* column than what's already
         # active is a deliberate request to redo training under that column --
@@ -292,6 +315,7 @@ def train():
         excluded_leakage = STATE.get("excluded_as_leakage") or []
         excluded_wave_pair = STATE.get("excluded_as_wave_pair") or []
         excluded_context = STATE.get("excluded_as_context") or []
+        excluded_low_coverage = STATE.get("excluded_as_low_coverage") or []
         dropped_for_rebalancing = STATE.get("dropped_for_rebalancing") or []
         retrain_attempts = 0
     else:
@@ -302,28 +326,36 @@ def train():
         if treatment_col is None:
             return jsonify({"error": "could not auto-detect a treatment/control column in this dataset; retry with a 'treatment_column' form field"}), 400
 
-        extra_exclude = set()
-        dropped_for_rebalancing = []
-        model, top_features, final_importances, excluded_leakage, excluded_wave_pair, excluded_context = None, None, None, None, None, None
+        current_top_n = TOP_N_FEATURES
+        initial_top_features = None
+        model, top_features, final_importances = None, None, None
+        excluded_leakage, excluded_wave_pair, excluded_context, excluded_low_coverage = None, None, None, None
         balance = None
         for attempt in range(1, MAX_RETRAIN_ATTEMPTS + 1):
             retrain_attempts = attempt
             try:
-                top_features, final_importances, excluded_leakage, excluded_wave_pair, excluded_context = core.select_top_features(
-                    df, treatment_col, treatment_binarized, top_n=TOP_N_FEATURES, extra_exclude=extra_exclude)
+                top_features, final_importances, excluded_leakage, excluded_wave_pair, excluded_context, excluded_low_coverage = core.select_top_features(
+                    df, treatment_col, treatment_binarized, top_n=current_top_n)
                 model, _ = core.train_psm_model(df, treatment_binarized, top_features)
             except ValueError as e:
                 return jsonify({"error": str(e)}), 400
+            if initial_top_features is None:
+                initial_top_features = top_features
 
             ps, _X = _score("dynamic", model, top_features, None, df)
             balance = core.covariate_balance(df, treatment_binarized, top_features, core.logit(ps))
-            if balance["balance_achieved"] or not balance.get("worst_feature") or attempt == MAX_RETRAIN_ATTEMPTS:
+            if balance["balance_achieved"] or attempt == MAX_RETRAIN_ATTEMPTS:
                 break
-            dropped_for_rebalancing.append(balance["worst_feature"])
-            extra_exclude.add(balance["worst_feature"])
+            next_n = max(MIN_BALANCE_FEATURES, math.ceil(len(top_features) * BALANCE_SHRINK_FACTOR))
+            if next_n >= len(top_features):
+                break  # can't shrink further -- give up with whatever this attempt has
+            current_top_n = next_n
+
+        dropped_for_rebalancing = sorted(set(initial_top_features) - set(top_features))
 
         STATE.update({
             "model": model,
+            "training_version": DYNAMIC_TRAINING_VERSION,
             "feature_cols": top_features,
             "importances": final_importances,
             "treatment_col": treatment_col,
@@ -335,6 +367,7 @@ def train():
             "excluded_as_leakage": excluded_leakage,
             "excluded_as_wave_pair": excluded_wave_pair,
             "excluded_as_context": excluded_context,
+            "excluded_as_low_coverage": excluded_low_coverage,
             "dropped_for_rebalancing": dropped_for_rebalancing,
         })
         save_state()
@@ -347,7 +380,12 @@ def train():
     shap_contributions = core.compute_shap_feature_contributions(model, X_used, top_features)
     socioeconomic_insights = core.generate_socioeconomic_insights(shap_contributions)
 
-    ranked = sorted(final_importances.items(), key=lambda kv: kv[1], reverse=True)
+    selected_set = set(top_features)
+    ranked = [
+        (name, imp)
+        for name, imp in sorted(final_importances.items(), key=lambda kv: kv[1], reverse=True)
+        if name in selected_set
+    ]
     ranked_features = [{"feature": name, "importance": imp} for name, imp in ranked]
 
     return jsonify({
@@ -366,6 +404,7 @@ def train():
             "excluded_as_leakage": excluded_leakage,
             "excluded_as_wave_pair": excluded_wave_pair,
             "excluded_as_context": excluded_context,
+            "excluded_as_low_coverage": excluded_low_coverage,
             "dropped_for_rebalancing": dropped_for_rebalancing,
         },
         # ps_output describes ROWS/RESPONDENTS -- one propensity score per row
@@ -559,7 +598,12 @@ def health():
     if STATE["model"] is None:
         response["dynamic"] = {"status": "empty", "message": "no dataset trained yet; POST a CSV to /train"}
     else:
-        ranked = sorted(STATE["importances"].items(), key=lambda kv: kv[1], reverse=True)
+        selected_set = set(STATE["feature_cols"])
+        ranked = [
+            (name, imp)
+            for name, imp in sorted(STATE["importances"].items(), key=lambda kv: kv[1], reverse=True)
+            if name in selected_set
+        ]
         response["dynamic"] = {
             "status": "ok",
             "source_filename": STATE["source_filename"],

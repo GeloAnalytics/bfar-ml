@@ -485,6 +485,10 @@ def logit(p):
     return np.log(p / (1 - p))
 
 
+def _sigmoid(x):
+    return 1.0 / (1.0 + np.exp(-x))
+
+
 def _match_pairs(ps_logit_final, treatments, caliper_ratio=0.2):
     """1-nearest-neighbor matching of treated to control units on the
     logit-scale propensity score, within a caliper. Shared by matched_att
@@ -606,6 +610,43 @@ def standardized_mean_diff(X, treatments):
     return smd
 
 
+def _stabilized_ipw_weights(ps, treatments, ps_lower=0.05, ps_upper=0.95):
+    """Stabilized inverse-propensity weights, mirroring the reference PSM notebook's
+    Cell 9: rows with a propensity score outside [ps_lower, ps_upper] are trimmed
+    (weight 0, excluded below) since a near-0/near-1 score produces an unstably huge
+    weight. Retained rows get P(treat)/ps if treated, (1-P(treat))/(1-ps) if control.
+    Returns (weights, trimmed_mask)."""
+    mask = (ps > ps_lower) & (ps < ps_upper)
+    weights = np.zeros_like(ps, dtype=float)
+    if mask.sum() == 0 or (treatments[mask] == 1).sum() == 0 or (treatments[mask] == 0).sum() == 0:
+        return weights, mask
+    p_treat = treatments[mask].mean()
+    treat_mask = mask & (treatments == 1)
+    control_mask = mask & (treatments == 0)
+    weights[treat_mask] = p_treat / ps[treat_mask]
+    weights[control_mask] = (1 - p_treat) / (1 - ps[control_mask])
+    return weights, mask
+
+
+def weighted_standardized_mean_diff(X, treatments, weights):
+    """IPW-weighted standardized mean difference per column: reweights the *entire*
+    retained sample by stabilized inverse-propensity weights (see
+    _stabilized_ipw_weights), instead of restricting to 1-NN matched pairs like
+    standardized_mean_diff. `X`/`treatments`/`weights` should already be trimmed to
+    rows with nonzero weight."""
+    treat_mask = treatments == 1
+    control_mask = treatments == 0
+    Xt, Xc = X[treat_mask], X[control_mask]
+    wt, wc = weights[treat_mask], weights[control_mask]
+    mean_t = np.average(Xt, axis=0, weights=wt)
+    mean_c = np.average(Xc, axis=0, weights=wc)
+    var_t = np.average((Xt - mean_t) ** 2, axis=0, weights=wt)
+    var_c = np.average((Xc - mean_c) ** 2, axis=0, weights=wc)
+    pooled_std = np.sqrt((var_t + var_c) / 2)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        return np.where(pooled_std > 0, (mean_t - mean_c) / pooled_std, 0.0)
+
+
 def _unbalanced_feature_verdict(abs_smd, n_features, max_unbalanced_pct):
     """Count-based balance verdict: how many features individually exceed
     BALANCE_THRESHOLD, and is that count within the tolerated cap. See
@@ -625,6 +666,19 @@ def covariate_balance(df, treatment_binarized, feature_cols, ps_logit, caliper_r
     |SMD after matching| >= balance_threshold (falls back to pre-match SMD if no pairs
     matched). Also reports the single worst-balanced feature, for a caller that wants
     to drop it and retry (see app.py's /train re-tune loop).
+
+    Also includes an `ipw` block: the same per-feature SMD but reweighted by
+    stabilized inverse-propensity weights across the whole (trimmed) sample, instead
+    of restricted to matched pairs -- the reference PSM notebook's Cell 9 primary
+    balance check (see _stabilized_ipw_weights, weighted_standardized_mean_diff).
+    Context only: it does NOT feed into balance_achieved/worst_feature, since matching
+    (not IPW) is what this service's ATT estimate actually uses (see matched_att). On
+    this project's real dataset, IPW balance comes out meaningfully tighter than
+    matched balance once a dynamic model selects 100+ raw covariates -- 1-NN matching
+    only guarantees balance on the scalar propensity score, not on every individual
+    covariate, so a caller can use this to see whether the matched verdict is
+    pessimistic because the covariate set is just large, not because the propensity
+    model is bad.
     """
     treatments = treatment_binarized.to_numpy()
     if (treatments == 0).sum() == 0 or (treatments == 1).sum() == 0:
@@ -639,18 +693,32 @@ def covariate_balance(df, treatment_binarized, feature_cols, ps_logit, caliper_r
             "overlap": {"treated_in_control_range_pct": None, "control_in_treated_range_pct": None},
             "per_feature": [],
             "worst_feature": None,
+            "ipw": {"mean_abs_smd": None, "n_features_over_threshold": None, "trimmed_n": 0},
             "error": "need both treated and control records to assess balance",
         }
 
     X = df[feature_cols].fillna(0).to_numpy(dtype=float)
     pre_smd = standardized_mean_diff(X, treatments)
 
+    ps = _sigmoid(ps_logit)
+    ipw_weights, ipw_mask = _stabilized_ipw_weights(ps, treatments)
+    if ipw_mask.sum() > 0 and (treatments[ipw_mask] == 1).any() and (treatments[ipw_mask] == 0).any():
+        ipw_smd = weighted_standardized_mean_diff(X[ipw_mask], treatments[ipw_mask], ipw_weights[ipw_mask])
+    else:
+        ipw_smd = np.full(len(feature_cols), np.nan)
+    finite_abs_ipw = np.abs(ipw_smd)[np.isfinite(ipw_smd)]
+    ipw_summary = {
+        "mean_abs_smd": json_safe_float(float(np.mean(finite_abs_ipw))) if len(finite_abs_ipw) else None,
+        "n_features_over_threshold": int(np.sum(finite_abs_ipw > balance_threshold)) if len(finite_abs_ipw) else None,
+        "trimmed_n": int(ipw_mask.sum()),
+    }
+
     matched_pairs, caliper, err = _match_pairs(ps_logit, treatments, caliper_ratio)
 
     if err or not matched_pairs:
         per_feature = [
-            {"feature": name, "smd_before": json_safe_float(pre), "smd_after": None}
-            for name, pre in zip(feature_cols, pre_smd)
+            {"feature": name, "smd_before": json_safe_float(pre), "smd_after": None, "smd_ipw": json_safe_float(ipw)}
+            for name, pre, ipw in zip(feature_cols, pre_smd, ipw_smd)
         ]
         mean_abs_smd = float(np.mean(np.abs(pre_smd))) if len(pre_smd) else None
         worst_idx = int(np.argmax(np.abs(pre_smd))) if len(pre_smd) else None
@@ -666,6 +734,7 @@ def covariate_balance(df, treatment_binarized, feature_cols, ps_logit, caliper_r
             "overlap": {"treated_in_control_range_pct": None, "control_in_treated_range_pct": None},
             "per_feature": per_feature,
             "worst_feature": feature_cols[worst_idx] if worst_idx is not None else None,
+            "ipw": ipw_summary,
         }
 
     treat_idx = np.array([p[0] for p in matched_pairs])
@@ -675,8 +744,8 @@ def covariate_balance(df, treatment_binarized, feature_cols, ps_logit, caliper_r
     post_smd = standardized_mean_diff(matched_X, matched_treatments)
 
     per_feature = [
-        {"feature": name, "smd_before": json_safe_float(pre), "smd_after": json_safe_float(post)}
-        for name, pre, post in zip(feature_cols, pre_smd, post_smd)
+        {"feature": name, "smd_before": json_safe_float(pre), "smd_after": json_safe_float(post), "smd_ipw": json_safe_float(ipw)}
+        for name, pre, post, ipw in zip(feature_cols, pre_smd, post_smd, ipw_smd)
     ]
     abs_post = np.abs(post_smd)
     worst_idx = int(np.argmax(abs_post))
@@ -703,4 +772,5 @@ def covariate_balance(df, treatment_binarized, feature_cols, ps_logit, caliper_r
         "overlap": overlap,
         "per_feature": per_feature,
         "worst_feature": feature_cols[worst_idx],
+        "ipw": ipw_summary,
     }
