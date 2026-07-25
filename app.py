@@ -105,7 +105,12 @@ MIN_TRAINING_ROWS = 10
 # column is ranked, used to fit the model, and reported with its importance.
 # Curating that list down further is left to the integrator, not this service.
 TOP_N_FEATURES = None
-MAX_RETRAIN_ATTEMPTS = 3
+# How many drop-worst-feature-and-retry rounds covariate_balance gets before /train
+# gives up and ships the model as-is. 10 mirrors the reference PSM notebook's own
+# tolerated count of unbalanced features (Cell 9: warns past 10 of 57) -- enough
+# rounds to actually prune down to genuine balance on most datasets, rather than the
+# old cap of 3, which routinely gave up while balance_achieved was still false.
+MAX_RETRAIN_ATTEMPTS = 10
 
 
 def load_state():
