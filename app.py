@@ -96,6 +96,7 @@ STATE = {
     "trained_columns": None,
     "excluded_as_leakage": None,
     "excluded_as_wave_pair": None,
+    "excluded_as_context": None,
     "dropped_for_rebalancing": None,
 }
 
@@ -214,19 +215,22 @@ def train():
     upload. Any other column set retrains from scratch, Teachable-Machine
     style: auto-detects the treatment/control column (see
     psm_core.detect_treatment_column), then narrows numeric candidate columns
-    through two filters before ranking: (1) a before/after wave-pair
-    structural match (psm_core._wave_pair_excluded_columns) -- a column
-    that's the "current" half of a pair sharing an identical name except for
-    an isolated A/B token (e.g. D1.2:A_MOTORC / D1.2:B_MOTORC); a structural
-    pattern, not a hardcoded word list, so it generalizes to other
-    before/after-design datasets, not just bfar.csv; (2) near-perfect
-    correlation with treatment (psm_core._leakage_correlated_columns).
-    Whatever survives both gets ranked by importance and fit on in full --
-    no top-N cap (psm_core.select_top_features, psm_core.train_psm_model).
-    The full ranking ships in the response (feature_selection.selected /
+    through three filters before ranking: (1) a demographic/respondent-identity
+    keyword match (psm_core._context_excluded_columns) -- generic survey
+    terms like age, sex, area, education, not tied to any one program's
+    naming scheme; (2) a before/after wave-pair structural match
+    (psm_core._wave_pair_excluded_columns) -- a column that's the "current"
+    half of a pair sharing an identical name except for an isolated A/B
+    token (e.g. D1.2:A_MOTORC / D1.2:B_MOTORC); a structural pattern, not a
+    hardcoded word list, so it generalizes to other before/after-design
+    datasets, not just bfar.csv; (3) near-perfect correlation with treatment
+    (psm_core._leakage_correlated_columns). Whatever survives all three gets
+    ranked by importance and fit on in full -- no top-N cap
+    (psm_core.select_top_features, psm_core.train_psm_model). The full
+    ranking ships in the response (feature_selection.selected /
     model_interpretation.feature_contributions) so the integrator can curate
     the list further downstream; this service doesn't cut it down for you
-    beyond the two filters above. If covariate balance isn't achieved (more
+    beyond the three filters above. If covariate balance isn't achieved (more
     than MAX_UNBALANCED_FEATURE_PCT of features individually have |SMD| after
     matching >= 0.1 -- a count-based tolerance, not a mean-based gate, see
     psm_core.covariate_balance), the single worst-balanced feature is dropped
@@ -282,6 +286,7 @@ def train():
         final_importances = STATE["importances"]
         excluded_leakage = STATE.get("excluded_as_leakage") or []
         excluded_wave_pair = STATE.get("excluded_as_wave_pair") or []
+        excluded_context = STATE.get("excluded_as_context") or []
         dropped_for_rebalancing = STATE.get("dropped_for_rebalancing") or []
         retrain_attempts = 0
     else:
@@ -294,12 +299,12 @@ def train():
 
         extra_exclude = set()
         dropped_for_rebalancing = []
-        model, top_features, final_importances, excluded_leakage, excluded_wave_pair = None, None, None, None, None
+        model, top_features, final_importances, excluded_leakage, excluded_wave_pair, excluded_context = None, None, None, None, None, None
         balance = None
         for attempt in range(1, MAX_RETRAIN_ATTEMPTS + 1):
             retrain_attempts = attempt
             try:
-                top_features, final_importances, excluded_leakage, excluded_wave_pair = core.select_top_features(
+                top_features, final_importances, excluded_leakage, excluded_wave_pair, excluded_context = core.select_top_features(
                     df, treatment_col, treatment_binarized, top_n=TOP_N_FEATURES, extra_exclude=extra_exclude)
                 model, _ = core.train_psm_model(df, treatment_binarized, top_features)
             except ValueError as e:
@@ -324,6 +329,7 @@ def train():
             "trained_columns": uploaded_columns,
             "excluded_as_leakage": excluded_leakage,
             "excluded_as_wave_pair": excluded_wave_pair,
+            "excluded_as_context": excluded_context,
             "dropped_for_rebalancing": dropped_for_rebalancing,
         })
         save_state()
@@ -354,6 +360,7 @@ def train():
             "selected": ranked_features,
             "excluded_as_leakage": excluded_leakage,
             "excluded_as_wave_pair": excluded_wave_pair,
+            "excluded_as_context": excluded_context,
             "dropped_for_rebalancing": dropped_for_rebalancing,
         },
         # ps_output describes ROWS/RESPONDENTS -- one propensity score per row

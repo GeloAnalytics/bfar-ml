@@ -9,10 +9,10 @@ not a feature-importances_ stand-in.
 
 A more elaborate demographic-keyword / before-after-wave-pair / low-coverage / manual
 override column exclusion system was built, tested, and then reverted — too complex
-for the value it added. Re-added just the one piece that was actually solving a
-correctness problem rather than a stylistic preference: the before/after wave-pair
-structural detector (see below). No demographic-keyword list, no low-coverage filter,
-no manual exclude_columns/include_columns overrides -- deliberately minimal.
+for the value it added. Re-added in two steps since: the before/after wave-pair
+structural detector first (a correctness fix -- post-treatment data as a PS
+predictor), then the demographic-keyword filter on top of it (see below). Still no
+low-coverage filter and no manual exclude_columns/include_columns overrides.
 
 ## 1. Architecture
 
@@ -62,7 +62,7 @@ currently active model. Identical → skip training entirely, reuse the existing
 against the new upload's rows regardless, since those describe *this* upload, not
 whether the model changed.
 
-### Feature selection — no cap, two exclusion filters
+### Feature selection — no cap, three exclusion filters
 
 1. Auto-detect the treatment/control column (`psm_core.detect_treatment_column`;
    override via `treatment_column` form field). `test_ui.html`'s train form exposes
@@ -72,8 +72,15 @@ whether the model changed.
    exact column name. Confirmed end-to-end: selecting a column other than the
    auto-detector's obvious pick still submits `treatment_column` and the response
    comes back with `treatment_detection_method: "manual_override"` for that column.
-2. Narrow numeric, non-ID-like candidate columns through two filters, in order (each
+2. Narrow numeric, non-ID-like candidate columns through three filters, in order (each
    reported separately in `feature_selection`):
+   - **Demographic/respondent-identity keyword match**
+     (`psm_core._context_excluded_columns`) -- generic survey terms (age, respondent,
+     area, sex, marital status, education, ...), not tied to any one program's naming
+     scheme. Verified against bfar.csv's 215 raw columns: 5 exact matches (`AREA`,
+     `AGE`, `SEX`, `M-STATUS`, `EDUCATION`), zero false positives. Household size
+     (`B8:HH_SIZE`) is deliberately *not* included -- treated as livelihood-adjacent
+     (household composition affects economic need), not pure demographics.
    - **Before/after wave-pair structural match** (`psm_core._wave_pair_excluded_columns`)
      -- a column that's the "current" half of a pair sharing an identical name except
      for one isolated `A`/`B` token (e.g. `D1.2:A_MOTORC` / `D1.2:B_MOTORC`). Confirmed
@@ -87,8 +94,8 @@ whether the model changed.
      current-wave columns have no "before" twin to pair against at all (bfar.csv's
      `C2:INCOME/B/FISH`, `C4:INCOME/B/ALT`, `C5:TOT_INCOME/B` -- current income, but the
      questionnaire never asked a matching "before" breakdown by source) -- no generic
-     structural signal can catch these; not addressed, by design (no manual override
-     system was re-added -- see below).
+     structural signal can catch these directly, though the covariate-balance re-tune
+     loop below sometimes drops them anyway for being poorly balanced.
    - **Leakage correlation with treatment** (`psm_core._leakage_correlated_columns`,
      ≥0.95 correlation with treatment's value or null-pattern) -- unchanged from
      before; this is what catches bfar.csv's entire J-series (boat-repair-specific
@@ -99,13 +106,14 @@ whether the model changed.
    decided by this service.
 
 On the full 215-column `bfar.csv` (not just the 57-feature baseline subset), this
-narrows candidates to 110: ~69 wave-pair, 29 leakage excluded. Deliberately does
-*not* filter demographics (age, sex, education...) or low-data-coverage columns, and
-has no `exclude_columns`/`include_columns` override -- an earlier, more elaborate
-version tried all of that and was reverted for being too complex relative to the
-value it added; only the wave-pair detector survived, since it's the one piece
-addressing an actual correctness problem (post-treatment data as a PS predictor)
-rather than a stylistic preference.
+narrows candidates to 107: 4 demographic, ~68 wave-pair, 29 leakage excluded (plus
+occasionally 1-2 more dropped during balance re-tuning). Still has no low-data-coverage
+filter and no `exclude_columns`/`include_columns` override -- an earlier, more
+elaborate version tried all of that and was reverted for being too complex relative to
+the value it added. The wave-pair filter was re-added first, since it addresses a real
+correctness problem (post-treatment data as a PS predictor, not just a stylistic
+preference); the demographic-keyword filter was re-added afterward on top of it, at
+explicit request.
 
 ### Covariate-balance re-tune loop (steps 5–7 of the pipeline diagram)
 
@@ -135,8 +143,8 @@ final, balanced or not (`retrain_attempts` reports how many were used).
 
 Model + feature set + treatment column + `trained_columns` (for the next call's
 retrain-skip check) + `excluded_as_leakage` + `excluded_as_wave_pair` +
-`dropped_for_rebalancing` are all saved to `models/dynamic/` (`model.pkl` +
-`meta.json`) so a restart doesn't lose them.
+`excluded_as_context` + `dropped_for_rebalancing` are all saved to `models/dynamic/`
+(`model.pkl` + `meta.json`) so a restart doesn't lose them.
 
 ## 4. `POST /train` response shape
 
@@ -163,6 +171,7 @@ normal, not a bug -- one counts people, the other counts predictor columns.
     "selected": [{"feature": str, "importance": float}, ...],   # every ranked candidate, no cap
     "excluded_as_leakage": [str, ...],
     "excluded_as_wave_pair": [str, ...],
+    "excluded_as_context": [str, ...],
     "dropped_for_rebalancing": [str, ...]
   },
   # Describes ROWS/RESPONDENTS -- exactly one propensity score per uploaded
@@ -257,11 +266,10 @@ PS quartiles.
   up discarding a feature that was actually carrying real signal (it optimizes for
   balance, not predictive accuracy).
 - No cross-validation or held-out evaluation for the dynamic path.
-- Column selection excludes leakage-correlated columns and before/after wave-pairs,
-  but does *not* filter demographic columns (age, sex, education...) or low-coverage
-  columns, and has no manual exclude/include override -- deliberately minimal; a more
-  elaborate version tried all of that and was reverted for being too complex relative
-  to the value added.
+- Column selection excludes leakage-correlated columns, before/after wave-pairs, and
+  demographic columns (via a generic keyword list), but has no low-coverage filter and
+  no manual exclude/include override -- a more elaborate version tried all of that and
+  was reverted for being too complex relative to the value added.
 - The wave-pair detector only catches columns with a genuine "before" counterpart to
   structurally pair against. A "current wave" column with no such counterpart (e.g.
   bfar.csv's `C2:INCOME/B/FISH`) has no generic signal indicating it's post-treatment

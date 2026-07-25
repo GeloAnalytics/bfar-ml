@@ -17,18 +17,21 @@ The dynamic model works **Teachable-Machine style**: every `POST /train` call wi
 new column set deletes whatever model is currently active and trains a completely
 fresh one on the new upload -- ranking every usable column by feature importance and
 fitting on all of them, no top-N cap and no merging with the previous schema. Before
-ranking, candidates are narrowed by two filters (each reported separately in
-`feature_selection`): a before/after wave-pair structural match (a column that's the
-"current" half of a pair sharing an identical name except for one A/B token --
-confirmed against the actual BFAR beneficiary questionnaire's baseline/endline design;
-a structural pattern, not a hardcoded word list, so it generalizes across similar
-before/after survey designs) and leakage correlation with treatment. The full ranking
-of what survives ships in the response (`feature_selection.selected`); curating that
-list down further is left to the integrator, not this service. If the uploaded CSV's
-columns exactly match the columns of whatever dataset trained the currently active
-model, training is skipped entirely and the existing model is reused as-is
-(`retrained: false` in the response) -- only re-scored against the new upload. See
-`DYNAMIC_TRAINING.md` for the full design and why this replaced an earlier
+ranking, candidates are narrowed by three filters (each reported separately in
+`feature_selection`): a demographic/respondent-identity keyword match (generic survey
+terms like age, sex, area, education -- not tied to any one program's naming scheme;
+household size is deliberately kept, treated as livelihood-adjacent rather than
+demographic), a before/after wave-pair structural match (a column that's the "current"
+half of a pair sharing an identical name except for one A/B token -- confirmed against
+the actual BFAR beneficiary questionnaire's baseline/endline design; a structural
+pattern, not a hardcoded word list, so it generalizes across similar before/after
+survey designs), and leakage correlation with treatment. The full ranking of what
+survives ships in the response (`feature_selection.selected`); curating that list down
+further is left to the integrator, not this service. If the uploaded CSV's columns
+exactly match the columns of whatever dataset trained the currently active model,
+training is skipped entirely and the existing model is reused as-is (`retrained: false`
+in the response) -- only re-scored against the new upload. See `DYNAMIC_TRAINING.md`
+for the full design and why this replaced an earlier
 index-mapping approach.
 
 If covariate balance isn't achieved after fitting -- more than 20% of features
@@ -179,14 +182,15 @@ currently active model, retraining is skipped** (`retrained: false`) and that mo
 just re-scored against this upload. Otherwise it deletes whatever dynamic model is
 currently active and trains a completely fresh one -- ranks every usable numeric
 column by importance for predicting the detected treatment column, after excluding
-(1) before/after wave-pair columns (a column that's the "current" half of a pair
-sharing an identical name except for one A/B token) and (2) near-perfect treatment
-proxies, then fits on **all** that remain -- no top-N cap; the full ranking ships back
-in `feature_selection.selected` and it's on the integrator to curate that list further
-if they want a smaller feature set. If covariate balance isn't achieved, drops the
-single worst-balanced feature and retries (up to 3 attempts total, see
-`retrain_attempts`). Nothing carries over from any previous `/train` call that
-actually retrained.
+(1) demographic/respondent-identity columns (a generic keyword match -- age, sex,
+area, education, etc.), (2) before/after wave-pair columns (a column that's the
+"current" half of a pair sharing an identical name except for one A/B token), and (3)
+near-perfect treatment proxies, then fits on **all** that remain -- no top-N cap; the
+full ranking ships back in `feature_selection.selected` and it's on the integrator to
+curate that list further if they want a smaller feature set. If covariate balance
+isn't achieved, drops the single worst-balanced feature and retries (up to 3 attempts
+total, see `retrain_attempts`). Nothing carries over from any previous `/train` call
+that actually retrained.
 
 **Two independent counts, don't confuse them:** `rows` / `ps_output.n_rows_scored` is
 the number of *respondents* -- one propensity score per row, period, regardless of
@@ -207,6 +211,7 @@ is expected, not a bug.
     "selected": [{"feature": "monthly_income", "importance": 0.11}, "..."],
     "excluded_as_leakage": ["group_assignment_code"],
     "excluded_as_wave_pair": ["assets_endline_motorcycle"],
+    "excluded_as_context": ["respondent_age", "respondent_sex"],
     "dropped_for_rebalancing": []
   },
   "ps_output": {

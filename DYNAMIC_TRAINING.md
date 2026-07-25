@@ -14,11 +14,11 @@ deletes whatever model is currently active and trains a completely fresh one on 
 new upload — no merging with the previous schema, no persisted history beyond "the
 most recent model." Feature selection is what it's always been: rank every usable
 column in the upload by feature importance -- with no top-N cap, every candidate
-survives except a before/after wave-pair structural match (see below) or a
-leakage-correlated one. Curating that ranked list down to a smaller working set is
-the integrator's call, not something this service decides for them. Any dataset with
-enough usable columns and a detectable treatment/control indicator can be trained on,
-regardless of what its headers are called.
+survives except a demographic keyword match, a before/after wave-pair structural match
+(see below), or a leakage-correlated one. Curating that ranked list down to a smaller
+working set is the integrator's call, not something this service decides for them. Any
+dataset with enough usable columns and a detectable treatment/control indicator can be
+trained on, regardless of what its headers are called.
 
 This restores the *original* `app_dynamic.py` design (last present at commit
 `e1a2d1e`) with one deliberate simplification: the old version's 90%-coverage
@@ -39,7 +39,7 @@ columns cover:
 | **Model** | `models/best_model.pkl`, frozen, produced by `build_model.py` | Whatever `POST /train` last produced |
 | **Retrained on upload?** | Never | Every `/train` call, unless the upload's columns exactly match what trained the active model |
 | **Persisted?** | Yes, committed to the repo | Yes, `models/dynamic/` (gitignored runtime state) |
-| **Feature set** | The fixed 57 bfar features | All non-wave-pair, non-leakage-correlated candidates, ranked by importance, fresh each retrain -- no top-N cap |
+| **Feature set** | The fixed 57 bfar features | All non-demographic, non-wave-pair, non-leakage-correlated candidates, ranked by importance, fresh each retrain -- no top-N cap |
 
 The baseline path exists because it's free — bfar.csv's own reference model needs no
 training step and is always available, so a request that happens to carry the exact
@@ -63,8 +63,14 @@ model. Any column added, removed, or renamed forces a full retrain.
 1. Parse the uploaded CSV; reject if fewer than 10 rows.
 2. Auto-detect the treatment/control column (`psm_core.detect_treatment_column`;
    override with the `treatment_column` form field if it guesses wrong).
-3. Narrow numeric candidate columns through two filters, then rank the rest by
+3. Narrow numeric candidate columns through three filters, then rank the rest by
    importance for predicting treatment (`psm_core.select_top_features`):
+   - **Demographic/respondent-identity keyword match**
+     (`psm_core._context_excluded_columns`) — generic survey terms (age, respondent,
+     area, sex, marital status, education, ...), not tied to any one program's naming
+     scheme. 5 exact matches on bfar.csv's 215 columns, zero false positives.
+     Household size (`B8:HH_SIZE`) is deliberately excluded from this list — treated
+     as livelihood-adjacent, not pure demographics.
    - **Before/after wave-pair structural match** (`psm_core._wave_pair_excluded_columns`)
      — a column that's the "current" half of a pair sharing an identical name except
      for one isolated `A`/`B` token (e.g. `D1.2:A_MOTORC` / `D1.2:B_MOTORC`). Confirmed
@@ -74,7 +80,7 @@ model. Any column added, removed, or renamed forces a full retrain.
      to other before/after-design datasets. 71 pairs detected on bfar.csv, zero false
      positives. Known gap: a "current wave" column with no "before" twin (bfar.csv's
      `C2:INCOME/B/FISH` etc.) isn't caught this way — no generic signal indicates it's
-     post-treatment.
+     post-treatment (though the balance re-tune loop below sometimes drops it anyway).
    - **Leakage correlation with treatment** (`psm_core._leakage_correlated_columns` —
      a column whose null-pattern or raw values correlate ≥0.95 with treatment is
      almost certainly a renamed copy of the group assignment itself, not a genuine
