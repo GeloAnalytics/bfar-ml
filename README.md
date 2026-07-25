@@ -16,13 +16,20 @@ app in a background thread, started together by `python app.py`:
 The dynamic model works **Teachable-Machine style**: every `POST /train` call with a
 new column set deletes whatever model is currently active and trains a completely
 fresh one on the new upload -- ranking every usable column by feature importance and
-fitting on all of them, no top-N cap and no merging with the previous schema. The full
-ranking ships in the response (`feature_selection.selected`); curating that list down
-further is left to the integrator, not this service. If the uploaded CSV's columns
-exactly match the columns of whatever dataset trained the currently active model,
-training is skipped entirely and the existing model is reused as-is (`retrained: false`
-in the response) -- only re-scored against the new upload. See `DYNAMIC_TRAINING.md`
-for the full design and why this replaced an earlier index-mapping approach.
+fitting on all of them, no top-N cap and no merging with the previous schema. Before
+ranking, candidates are narrowed by two filters (each reported separately in
+`feature_selection`): a before/after wave-pair structural match (a column that's the
+"current" half of a pair sharing an identical name except for one A/B token --
+confirmed against the actual BFAR beneficiary questionnaire's baseline/endline design;
+a structural pattern, not a hardcoded word list, so it generalizes across similar
+before/after survey designs) and leakage correlation with treatment. The full ranking
+of what survives ships in the response (`feature_selection.selected`); curating that
+list down further is left to the integrator, not this service. If the uploaded CSV's
+columns exactly match the columns of whatever dataset trained the currently active
+model, training is skipped entirely and the existing model is reused as-is
+(`retrained: false` in the response) -- only re-scored against the new upload. See
+`DYNAMIC_TRAINING.md` for the full design and why this replaced an earlier
+index-mapping approach.
 
 If covariate balance isn't achieved after fitting -- more than 20% of features
 individually have |SMD| across matched pairs `>= 0.1` (count-based, not a mean
@@ -171,13 +178,15 @@ Optional form field: `treatment_column=enrolled_flag` (bypasses auto-detection).
 currently active model, retraining is skipped** (`retrained: false`) and that model is
 just re-scored against this upload. Otherwise it deletes whatever dynamic model is
 currently active and trains a completely fresh one -- ranks every usable numeric
-column by importance for predicting the detected treatment column (excluding
-near-perfect treatment proxies), then fits on **all** of them -- no top-N cap; the full
-ranking ships back in `feature_selection.selected` and it's on the integrator to
-curate that list further if they want a smaller feature set. If covariate balance
-isn't achieved, drops the single worst-balanced feature and retries (up to 3 attempts
-total, see `retrain_attempts`). Nothing carries over from any previous `/train` call
-that actually retrained.
+column by importance for predicting the detected treatment column, after excluding
+(1) before/after wave-pair columns (a column that's the "current" half of a pair
+sharing an identical name except for one A/B token) and (2) near-perfect treatment
+proxies, then fits on **all** that remain -- no top-N cap; the full ranking ships back
+in `feature_selection.selected` and it's on the integrator to curate that list further
+if they want a smaller feature set. If covariate balance isn't achieved, drops the
+single worst-balanced feature and retries (up to 3 attempts total, see
+`retrain_attempts`). Nothing carries over from any previous `/train` call that
+actually retrained.
 
 **Two independent counts, don't confuse them:** `rows` / `ps_output.n_rows_scored` is
 the number of *respondents* -- one propensity score per row, period, regardless of
@@ -197,6 +206,7 @@ is expected, not a bug.
     "n_features_selected": 27,
     "selected": [{"feature": "monthly_income", "importance": 0.11}, "..."],
     "excluded_as_leakage": ["group_assignment_code"],
+    "excluded_as_wave_pair": ["assets_endline_motorcycle"],
     "dropped_for_rebalancing": []
   },
   "ps_output": {

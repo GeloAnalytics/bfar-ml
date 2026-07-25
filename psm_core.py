@@ -27,6 +27,27 @@ _TREATMENT_NAME_HINTS = (
     "treat", "program", "particip", "enroll", "assist", "benefic",
     "recipient", "grant", "subsid", "loan", "interven",
 )
+# Detects "before/after" wave-pair columns sharing an identical name except
+# for a single standalone A vs B token -- e.g. bfar.csv's 'D1.2:A_MOTORC' /
+# 'D1.2:B_MOTORC', confirmed against the actual BFAR beneficiary
+# questionnaire (Parts C/D/E/F/G each ask every item twice: "BAGO MATANGGAP
+# ANG BANGKA" [before receiving the boat] / "SA KASALUKUYAN" [at present] --
+# a baseline/endline design). This is a *structural* pattern match, not a
+# hardcoded word list, so it generalizes to any dataset using a similar
+# two-wave naming convention -- common for livelihood-program impact
+# evaluations generally, not just this one. Verified against bfar.csv's 215
+# columns: 71 pairs detected, zero false positives (e.g. 'I2:A/C_M' --
+# association/club membership -- correctly left alone since no
+# 'I2:B/C_M' counterpart exists in the data).
+#
+# Known limitation: some "current wave" columns have no "before" twin to
+# pair against at all (bfar.csv's C2:INCOME/B/FISH, C4:INCOME/B/ALT,
+# C5:TOT_INCOME/B -- current income, but the questionnaire never asked a
+# matching "before" breakdown by source) and so aren't caught here. This is
+# the only column-selection filter beyond leakage-correlation -- deliberately
+# minimal, no demographic-keyword list or manual override system (tried and
+# reverted earlier for being too complex relative to the value added).
+_WAVE_PAIR_A_TOKEN = re.compile(r"(?<![A-Za-z0-9])A(?![A-Za-z0-9])")
 # Model types whose training data was standardized -- their predict_proba
 # expects scaled input too. Tree/boosting models split on raw thresholds
 # learned during training, so scaling them at predict time silently corrupts
@@ -161,6 +182,24 @@ def _numeric_candidate_columns(df, exclude):
     ]
 
 
+def _wave_pair_excluded_columns(columns):
+    """See _WAVE_PAIR_A_TOKEN above. For every column with a standalone 'A'
+    token, checks whether swapping it for 'B' matches another column already
+    in this dataset -- if so, that 'B' column is the "after" half of a
+    before/after pair and gets excluded; its 'A' counterpart is kept."""
+    columns = list(columns)
+    colset = set(columns)
+    excluded = set()
+    for col in columns:
+        name = str(col)
+        if not _WAVE_PAIR_A_TOKEN.search(name):
+            continue
+        b_version = _WAVE_PAIR_A_TOKEN.sub("B", name, count=1)
+        if b_version != name and b_version in colset:
+            excluded.add(b_version)
+    return excluded
+
+
 def _leakage_correlated_columns(df, treatment_col, treatment_binarized, candidate_cols, threshold=0.95):
     """
     Excludes candidates that are near-direct proxies for treatment, via two
@@ -202,11 +241,15 @@ def _leakage_correlated_columns(df, treatment_col, treatment_binarized, candidat
 
 
 def _rank_candidate_features(df, treatment_col, treatment_binarized, extra_exclude=None):
-    candidate_cols = _numeric_candidate_columns(df, exclude={treatment_col} | set(extra_exclude or ()))
+    base_candidates = _numeric_candidate_columns(df, exclude={treatment_col} | set(extra_exclude or ()))
+
+    wave_pair_excluded = _wave_pair_excluded_columns(base_candidates)
+    candidate_cols = [c for c in base_candidates if c not in wave_pair_excluded]
+
     leaky = _leakage_correlated_columns(df, treatment_col, treatment_binarized, candidate_cols)
     candidate_cols = [c for c in candidate_cols if c not in leaky]
     if not candidate_cols:
-        raise ValueError("no usable feature columns found (all numeric candidates were the treatment column or leakage-correlated with it)")
+        raise ValueError("no usable feature columns found -- all numeric candidates were the treatment column, wave-pair-excluded, or leakage-correlated with it")
 
     X = df[candidate_cols].fillna(0).to_numpy(dtype=float)
     y = treatment_binarized.to_numpy()
@@ -215,17 +258,24 @@ def _rank_candidate_features(df, treatment_col, treatment_binarized, extra_exclu
     ranker.fit(X, y)
 
     ranked = sorted(zip(candidate_cols, ranker.feature_importances_), key=lambda p: p[1], reverse=True)
-    return ranked, leaky
+    return ranked, leaky, wave_pair_excluded
 
 
 def select_top_features(df, treatment_col, treatment_binarized, top_n=None, extra_exclude=None):
     """
-    Fits a GradientBoostingClassifier on every numeric candidate column
-    (minus leakage-correlated ones, see _leakage_correlated_columns, and minus
-    `extra_exclude` -- used by app.py's covariate-balance re-tune loop to drop
-    a feature that failed balance and re-rank without it) to rank importance
-    for predicting `treatment_binarized`. Always a fresh ranking of whatever
-    this dataset provides -- no memory of any previous model's schema.
+    Fits a GradientBoostingClassifier on every numeric candidate column to
+    rank importance for predicting `treatment_binarized`. Always a fresh
+    ranking of whatever this dataset provides -- no memory of any previous
+    model's schema. Candidates are narrowed down first, in order:
+      1. Before/after wave-pair structural match (_wave_pair_excluded_columns)
+         -- a column that's the "current" half of a pair sharing an
+         identical name except for an isolated A/B token. A structural
+         pattern, not a hardcoded word list, so it generalizes to other
+         before/after-design datasets, not just bfar.csv.
+      2. Leakage correlation with treatment (_leakage_correlated_columns).
+    `extra_exclude` drops columns outright before ranking even starts --
+    used by app.py's covariate-balance re-tune loop to drop a feature that
+    failed balance and re-rank without it.
 
     `top_n=None` (the default) returns every ranked candidate -- no arbitrary
     cutoff, so the response can show the full importance ranking and the
@@ -233,11 +283,18 @@ def select_top_features(df, treatment_col, treatment_binarized, top_n=None, extr
     it instead.
 
     Returns (selected feature names, name->importance dict for every ranked
-    candidate, sorted list of columns excluded as leakage-correlated).
+    candidate, sorted list of columns excluded as leakage-correlated, sorted
+    list excluded as a before/after wave-pair).
     """
-    ranked, leaky = _rank_candidate_features(df, treatment_col, treatment_binarized, extra_exclude=extra_exclude)
+    ranked, leaky, wave_pair_excluded = _rank_candidate_features(
+        df, treatment_col, treatment_binarized, extra_exclude=extra_exclude)
     top = ranked if top_n is None else ranked[:top_n]
-    return [name for name, _ in top], {name: json_safe_float(imp) for name, imp in ranked}, sorted(leaky)
+    return (
+        [name for name, _ in top],
+        {name: json_safe_float(imp) for name, imp in ranked},
+        sorted(leaky),
+        sorted(wave_pair_excluded),
+    )
 
 
 def train_psm_model(df, treatment_binarized, feature_cols):
