@@ -7,10 +7,12 @@ model-interpretation / decision-support additions to `/train`'s response (steps 
 9, 10 below) are now live, and step 9 uses real SHAP values (`shap.TreeExplainer`),
 not a feature-importances_ stand-in.
 
-A more elaborate demographic-keyword / before-after-wave-pair column exclusion system
-was built, tested, and then reverted — too complex for the value it added. Column
-selection right now is back to: numeric, non-ID-like, minus leakage-correlated with
-treatment. Revisit with something simpler later.
+A more elaborate demographic-keyword / before-after-wave-pair / low-coverage / manual
+override column exclusion system was built, tested, and then reverted — too complex
+for the value it added. Re-added just the one piece that was actually solving a
+correctness problem rather than a stylistic preference: the before/after wave-pair
+structural detector (see below). No demographic-keyword list, no low-coverage filter,
+no manual exclude_columns/include_columns overrides -- deliberately minimal.
 
 ## 1. Architecture
 
@@ -60,7 +62,7 @@ currently active model. Identical → skip training entirely, reuse the existing
 against the new upload's rows regardless, since those describe *this* upload, not
 whether the model changed.
 
-### Feature selection — no cap
+### Feature selection — no cap, two exclusion filters
 
 1. Auto-detect the treatment/control column (`psm_core.detect_treatment_column`;
    override via `treatment_column` form field). `test_ui.html`'s train form exposes
@@ -70,15 +72,40 @@ whether the model changed.
    exact column name. Confirmed end-to-end: selecting a column other than the
    auto-detector's obvious pick still submits `treatment_column` and the response
    comes back with `treatment_detection_method: "manual_override"` for that column.
-2. Rank every numeric, non-ID-like candidate column by importance for predicting
-   treatment (`psm_core.select_top_features`, a throwaway
-   `GradientBoostingClassifier`).
-3. Exclude near-perfect treatment proxies (`psm_core._leakage_correlated_columns`,
-   ≥0.95 correlation with treatment's value or null-pattern).
-4. **Fit on every remaining ranked candidate — no top-N cutoff.** The full ranking is
+2. Narrow numeric, non-ID-like candidate columns through two filters, in order (each
+   reported separately in `feature_selection`):
+   - **Before/after wave-pair structural match** (`psm_core._wave_pair_excluded_columns`)
+     -- a column that's the "current" half of a pair sharing an identical name except
+     for one isolated `A`/`B` token (e.g. `D1.2:A_MOTORC` / `D1.2:B_MOTORC`). Confirmed
+     against the actual BFAR beneficiary questionnaire: Parts C/D/E/F/G each ask every
+     item twice ("before receiving the boat" / "at present" -- a baseline/endline
+     design). A *structural* pattern match (does a same-named counterpart column exist
+     with the token swapped?), not a hardcoded word list, so it generalizes to other
+     before/after-design datasets. Verified: 71 pairs detected on bfar.csv's 215 raw
+     columns, zero false positives (e.g. `I2:A/C_M` -- association/club membership --
+     correctly left alone since no `I2:B/C_M` counterpart exists). **Known gap:** some
+     current-wave columns have no "before" twin to pair against at all (bfar.csv's
+     `C2:INCOME/B/FISH`, `C4:INCOME/B/ALT`, `C5:TOT_INCOME/B` -- current income, but the
+     questionnaire never asked a matching "before" breakdown by source) -- no generic
+     structural signal can catch these; not addressed, by design (no manual override
+     system was re-added -- see below).
+   - **Leakage correlation with treatment** (`psm_core._leakage_correlated_columns`,
+     ≥0.95 correlation with treatment's value or null-pattern) -- unchanged from
+     before; this is what catches bfar.csv's entire J-series (boat-repair-specific
+     follow-up, populated only for beneficiaries) and `A2:GROUP` automatically.
+3. **Fit on every remaining ranked candidate — no top-N cutoff.** The full ranking is
    reported in `feature_selection.selected` / `model_interpretation.feature_contributions`;
    curating that list down to a smaller working set is left to the integrator, not
    decided by this service.
+
+On the full 215-column `bfar.csv` (not just the 57-feature baseline subset), this
+narrows candidates to 110: ~69 wave-pair, 29 leakage excluded. Deliberately does
+*not* filter demographics (age, sex, education...) or low-data-coverage columns, and
+has no `exclude_columns`/`include_columns` override -- an earlier, more elaborate
+version tried all of that and was reverted for being too complex relative to the
+value it added; only the wave-pair detector survived, since it's the one piece
+addressing an actual correctness problem (post-treatment data as a PS predictor)
+rather than a stylistic preference.
 
 ### Covariate-balance re-tune loop (steps 5–7 of the pipeline diagram)
 
@@ -107,8 +134,9 @@ final, balanced or not (`retrain_attempts` reports how many were used).
 ### Persistence
 
 Model + feature set + treatment column + `trained_columns` (for the next call's
-retrain-skip check) + `excluded_as_leakage` + `dropped_for_rebalancing` are all saved
-to `models/dynamic/` (`model.pkl` + `meta.json`) so a restart doesn't lose them.
+retrain-skip check) + `excluded_as_leakage` + `excluded_as_wave_pair` +
+`dropped_for_rebalancing` are all saved to `models/dynamic/` (`model.pkl` +
+`meta.json`) so a restart doesn't lose them.
 
 ## 4. `POST /train` response shape
 
@@ -134,6 +162,7 @@ normal, not a bug -- one counts people, the other counts predictor columns.
     "n_features_selected": int,
     "selected": [{"feature": str, "importance": float}, ...],   # every ranked candidate, no cap
     "excluded_as_leakage": [str, ...],
+    "excluded_as_wave_pair": [str, ...],
     "dropped_for_rebalancing": [str, ...]
   },
   # Describes ROWS/RESPONDENTS -- exactly one propensity score per uploaded
@@ -210,7 +239,7 @@ PS quartiles.
 |---|---|
 | 1. Raw data | ✅ `bfar.csv`, or whatever's uploaded to `/train` |
 | 2. Preprocessing | Handled upstream of this service (per integrator) — this service only does median/mode imputation and `.fillna(0)` at fit/score time |
-| 3. Feature engineering & selection | ✅ Importance-based ranking + leakage exclusion, surfaced in `feature_selection`; no PCA/clustering (handled upstream, per integrator) |
+| 3. Feature engineering & selection | ✅ Importance-based ranking + wave-pair + leakage exclusion, surfaced in `feature_selection`; no PCA/clustering (handled upstream, per integrator) |
 | 4. Stratified train-test split | ❌ Not done — both baseline and dynamic models fit on 100% of their data |
 | 5. PS estimation (multi-model) | Baseline compares all 4 candidates via CV; dynamic always uses Gradient Boosting, with the balance re-tune loop as its only iteration mechanism |
 | 6. PS output | ✅ `ps_output` in `/train`'s response, `ps_final`/`ps` in scoring responses |
@@ -228,7 +257,12 @@ PS quartiles.
   up discarding a feature that was actually carrying real signal (it optimizes for
   balance, not predictive accuracy).
 - No cross-validation or held-out evaluation for the dynamic path.
-- Column selection is currently just numeric + non-ID-like + leakage-correlation
-  exclusion -- no automatic filtering of demographic columns or before/after
-  survey-wave pairs (a more elaborate version of this was tried and reverted for
-  being too complex; revisit later with a simpler mechanism).
+- Column selection excludes leakage-correlated columns and before/after wave-pairs,
+  but does *not* filter demographic columns (age, sex, education...) or low-coverage
+  columns, and has no manual exclude/include override -- deliberately minimal; a more
+  elaborate version tried all of that and was reverted for being too complex relative
+  to the value added.
+- The wave-pair detector only catches columns with a genuine "before" counterpart to
+  structurally pair against. A "current wave" column with no such counterpart (e.g.
+  bfar.csv's `C2:INCOME/B/FISH`) has no generic signal indicating it's post-treatment
+  and will still be used as a candidate.
