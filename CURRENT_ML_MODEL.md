@@ -87,8 +87,17 @@ After fitting, `psm_core.covariate_balance`:
 - Computes standardized mean difference (SMD) per selected feature, before and after
   matching.
 - Computes PS common-support overlap between groups.
-- Verdict: `balance_achieved` = mean |SMD after matching| `< 0.1` (falls back to
-  pre-match SMD if no pairs matched).
+- Verdict: **count-based, not mean-based.** `balance_achieved` = true if no more than
+  `MAX_UNBALANCED_FEATURE_PCT` (20%) of features individually have |SMD after matching|
+  `>= 0.1` (falls back to pre-match SMD if no pairs matched). Reports
+  `n_features_over_threshold` and `max_unbalanced_features_allowed` alongside the
+  informational `mean_abs_smd`. Requiring the *average* SMD across every candidate to
+  be low turned out to be unrealistically strict once a dataset has 50-100+ real
+  socioeconomic covariates -- a handful of genuinely different features drags the mean
+  up and fails the whole model even when most features are well-matched. Mirrors the
+  reference PSM notebook's Cell 9 IPW balance check (tolerates up to 10 of 57 features,
+  ~17.5%, rather than an aggregate mean threshold), expressed as a percentage so it
+  scales with however many features a given dynamic model actually selected.
 
 If not achieved, the single worst-balanced feature is dropped
 (`dropped_for_rebalancing`) and steps above repeat, up to `MAX_RETRAIN_ATTEMPTS = 3`
@@ -122,7 +131,10 @@ to `models/dynamic/` (`model.pkl` + `meta.json`) so a restart doesn't lose them.
     "ps_summary": {"min", "max", "mean", "median"}
   },
   "covariate_balance": {             # step 7
-    "balance_achieved": bool, "mean_abs_smd": float, "balance_threshold": 0.1,
+    "balance_achieved": bool,          # count-based: see n_features_over_threshold below
+    "mean_abs_smd": float,             # informational only, no longer the deciding metric
+    "n_features_over_threshold": int, "max_unbalanced_features_allowed": int,
+    "balance_threshold": 0.1,
     "matched_pairs": int, "caliper": float,
     "overlap": {"treated_in_control_range_pct", "control_in_treated_range_pct"},
     "per_feature": [{"feature", "smd_before", "smd_after"}, ...],

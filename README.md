@@ -24,10 +24,11 @@ training is skipped entirely and the existing model is reused as-is (`retrained:
 in the response) -- only re-scored against the new upload. See `DYNAMIC_TRAINING.md`
 for the full design and why this replaced an earlier index-mapping approach.
 
-If covariate balance isn't achieved after fitting (mean |SMD| across matched pairs
-`>= 0.1`), `/train` automatically drops the single worst-balanced feature and retries,
-up to 3 attempts, before finalizing -- see `covariate_balance` in the response and
-`psm_core.covariate_balance`.
+If covariate balance isn't achieved after fitting -- more than 20% of features
+individually have |SMD| across matched pairs `>= 0.1` (count-based, not a mean
+threshold across all features) -- `/train` automatically drops the single
+worst-balanced feature and retries, up to 3 attempts, before finalizing -- see
+`covariate_balance` in the response and `psm_core.covariate_balance`.
 
 Both always start together (one process, `python app.py`) -- there's no flag to run
 just one, but each is an independent Flask server on its own port, so callers only
@@ -199,6 +200,8 @@ that actually retrained.
   "covariate_balance": {
     "balance_achieved": true,
     "mean_abs_smd": 0.061,
+    "n_features_over_threshold": 2,
+    "max_unbalanced_features_allowed": 6,
     "balance_threshold": 0.1,
     "matched_pairs": 180,
     "caliper": 0.24,
@@ -221,8 +224,10 @@ that actually retrained.
 ```
 `covariate_balance` (pipeline step 7) reports standardized mean difference per feature
 before/after 1-NN caliper matching, propensity-score common-support overlap between
-groups, and a `balance_achieved` verdict (mean |SMD after matching| `< 0.1`) --
-`psm_core.covariate_balance`. `model_interpretation` (step 9) is real SHAP values
+groups, and a `balance_achieved` verdict -- **count-based**: true if no more than 20%
+of features (`max_unbalanced_features_allowed`) individually exceed |SMD| `>= 0.1`
+(`n_features_over_threshold`), not a requirement that the *average* across every
+feature stays low -- `psm_core.covariate_balance`. `model_interpretation` (step 9) is real SHAP values
 (`psm_core.compute_shap_feature_contributions`, `shap.TreeExplainer` -- exact for tree
 ensembles, not approximated): mean absolute SHAP value per feature across every row in
 this upload (not a per-row breakdown, to keep the response a reasonable size), the
