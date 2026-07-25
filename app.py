@@ -337,13 +337,21 @@ def train():
         "rows": len(df),
         "treatment_column": treatment_col,
         "treatment_detection_method": method,
+        # feature_selection describes COLUMNS (which ones were used and why) --
+        # its list lengths are feature counts, unrelated to how many rows were
+        # uploaded. n_features_selected == len(selected), always.
         "feature_selection": {
             "n_features_selected": len(top_features),
             "selected": ranked_features,
             "excluded_as_leakage": excluded_leakage,
             "dropped_for_rebalancing": dropped_for_rebalancing,
         },
+        # ps_output describes ROWS/RESPONDENTS -- one propensity score per row
+        # of the uploaded CSV. len(ps) == len(ps_logit) == n_rows_scored ==
+        # "rows" above, always -- regardless of how many features were used to
+        # compute each score.
         "ps_output": {
+            "n_rows_scored": len(ps),
             "ps": [core.json_safe_float(v) for v in ps],
             "ps_logit": [core.json_safe_float(v) for v in ps_logit_arr],
             "ps_summary": {
@@ -354,9 +362,17 @@ def train():
             },
         },
         "covariate_balance": balance,
+        # model_interpretation also describes COLUMNS, not rows: a ranking of
+        # which features drove the model's predictions. n_features_ranked ==
+        # len(feature_contributions), a completely different number from
+        # ps_output.n_rows_scored above -- one counts respondents, the other
+        # counts input columns.
         "model_interpretation": {
-            "method": "SHAP (shap.TreeExplainer, exact for tree-ensemble models) -- mean |SHAP value| "
-                      "per feature across all rows in this upload, in the model's raw log-odds space",
+            "method": "SHAP (shap.TreeExplainer, exact for tree-ensemble models) -- ranks this "
+                      "dataset's INPUT COLUMNS (features) by mean |SHAP value| across every row, in "
+                      "the model's raw log-odds space. This is a feature ranking, not a per-row "
+                      "breakdown, and unrelated to how many propensity scores exist (see ps_output).",
+            "n_features_ranked": len(shap_contributions),
             "feature_contributions": shap_contributions,
             "socioeconomic_insights": socioeconomic_insights,
         },

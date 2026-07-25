@@ -112,6 +112,14 @@ to `models/dynamic/` (`model.pkl` + `meta.json`) so a restart doesn't lose them.
 
 ## 4. `POST /train` response shape
 
+**Two independent counts to keep straight:** `rows` (== `ps_output.n_rows_scored`)
+is the number of *respondents* in the upload -- one propensity score per row, always,
+regardless of feature count. `feature_selection.n_features_selected` (==
+`model_interpretation.n_features_ranked`) is the number of *columns* used as
+predictors -- unrelated to row count, and can be smaller, larger, or equal by pure
+coincidence. Seeing different numbers here (e.g. 1339 rows but only 11 features) is
+normal, not a bug -- one counts people, the other counts predictor columns.
+
 ```
 {
   "status": "trained",
@@ -120,13 +128,20 @@ to `models/dynamic/` (`model.pkl` + `meta.json`) so a restart doesn't lose them.
   "rows": int,
   "treatment_column": str,
   "treatment_detection_method": str,
+  # Describes COLUMNS (features) -- list lengths here are feature counts,
+  # unrelated to how many rows were uploaded.
   "feature_selection": {             # pipeline step 3, surfaced explicitly
     "n_features_selected": int,
     "selected": [{"feature": str, "importance": float}, ...],   # every ranked candidate, no cap
     "excluded_as_leakage": [str, ...],
     "dropped_for_rebalancing": [str, ...]
   },
+  # Describes ROWS/RESPONDENTS -- exactly one propensity score per uploaded
+  # row. len(ps) == len(ps_logit) == n_rows_scored == the top-level "rows"
+  # field, always, regardless of how many features were used to compute
+  # each score.
   "ps_output": {                     # step 6 — in-sample, on this upload
+    "n_rows_scored": int,
     "ps": [float, ...], "ps_logit": [float, ...],
     "ps_summary": {"min", "max", "mean", "median"}
   },
@@ -140,12 +155,17 @@ to `models/dynamic/` (`model.pkl` + `meta.json`) so a restart doesn't lose them.
     "per_feature": [{"feature", "smd_before", "smd_after"}, ...],
     "worst_feature": str
   },
+  # Also describes COLUMNS, not rows -- a ranking of which features drove
+  # the model's predictions. n_features_ranked is a different number from
+  # ps_output.n_rows_scored above: one counts respondents, the other counts
+  # input columns. These two counts being different is expected, not a bug.
   "model_interpretation": {          # step 9 — real SHAP values
     "method": "SHAP (shap.TreeExplainer, exact for tree-ensemble models) ...",
+    "n_features_ranked": int,
     "feature_contributions": [
       {"feature": str, "mean_abs_shap": float, "mean_shap": float, "direction": "increases_likelihood"|"decreases_likelihood"}, ...
     ],
-    "socioeconomic_insights": [str, ...]   # plain-language, generated from the top few contributions
+    "socioeconomic_insights": [str, ...]   # plain-language, generated from the top 5 by default -- always fewer than n_features_ranked once there are more than 5 features; the sentences themselves state "feature #N of 5 shown (... out of {n_features_ranked} features total)" so the two counts are never confused with each other or with row counts
   },
   "decision_support": [{"ps_group", "count", "interpretation", "mean_*"}, ...],  # step 10
   # kept for backwards compatibility with pre-upgrade callers:

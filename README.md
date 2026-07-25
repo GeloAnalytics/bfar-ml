@@ -178,6 +178,13 @@ curate that list further if they want a smaller feature set. If covariate balanc
 isn't achieved, drops the single worst-balanced feature and retries (up to 3 attempts
 total, see `retrain_attempts`). Nothing carries over from any previous `/train` call
 that actually retrained.
+
+**Two independent counts, don't confuse them:** `rows` / `ps_output.n_rows_scored` is
+the number of *respondents* -- one propensity score per row, period, regardless of
+feature count. `feature_selection.n_features_selected` /
+`model_interpretation.n_features_ranked` is the number of *predictor columns* used --
+unrelated to row count. Seeing different numbers here (e.g. 412 rows but 27 features)
+is expected, not a bug.
 ```json
 {
   "status": "trained",
@@ -193,6 +200,7 @@ that actually retrained.
     "dropped_for_rebalancing": []
   },
   "ps_output": {
+    "n_rows_scored": 412,
     "ps": [0.42, "..."],
     "ps_logit": [-0.32, "..."],
     "ps_summary": {"min": 0.03, "max": 0.97, "mean": 0.51, "median": 0.49}
@@ -211,11 +219,12 @@ that actually retrained.
   },
   "model_interpretation": {
     "method": "SHAP (shap.TreeExplainer, exact for tree-ensemble models) ...",
+    "n_features_ranked": 27,
     "feature_contributions": [
       {"feature": "monthly_income", "mean_abs_shap": 0.34, "mean_shap": 0.21, "direction": "increases_likelihood"}, "..."
     ],
     "socioeconomic_insights": [
-      "\"monthly_income\" is the strongest factor distinguishing participants from non-participants in this dataset -- higher values of this feature are associated with a higher likelihood of being in the treatment group.",
+      "Feature #1 of 5 shown (ranked by SHAP contribution to the propensity-score model, out of 27 features total) -- column \"monthly_income\": higher values in this column are associated with a higher likelihood of being in the treatment group. (This describes one input column, not an individual respondent.)",
       "..."
     ]
   },
