@@ -85,25 +85,26 @@ model. Any column added, removed, or renamed forces a full retrain.
      a column whose null-pattern or raw values correlate ≥0.95 with treatment is
      almost certainly a renamed copy of the group assignment itself, not a genuine
      covariate).
-4. Fit a fresh `GradientBoostingClassifier` on every ranked candidate
-   (`psm_core.train_psm_model`) -- no top-N cap; the full ranking is reported
-   back so the integrator can trim it further if they want a smaller feature
-   set for their own purposes.
+4. Fit a fresh `GradientBoostingClassifier` on every ranked candidate on the
+   first attempt (`psm_core.train_psm_model`) -- no top-N cap initially. If
+   balance retries are needed, later attempts keep progressively smaller
+   top-ranked subsets.
 5. **Check covariate balance** (`psm_core.covariate_balance`): 1-NN caliper-matches
    treated to control on the fitted model's propensity score, computes standardized
    mean difference per selected feature before/after matching. The verdict is
    **count-based, not a mean threshold**: balanced if no more than
-   `MAX_UNBALANCED_FEATURE_PCT` (20%) of features individually have |SMD after
+   `MAX_UNBALANCED_FEATURE_PCT` (35%) of features individually have |SMD after
    matching| `>= 0.1` -- not "the average across every feature must be low." An earlier
    version required the mean to be under 0.1, which turned out to fail almost every
    real dataset with 50+ covariates (a couple of genuinely different features drags the
    average up even when most features match well). Mirrors a reference PSM notebook's
    Cell 9 IPW balance check (tolerates up to 10 of 57 features, ~17.5%), expressed as a
-   percentage so it scales with feature count. If not balanced, the single
-   worst-balanced feature is dropped and steps 3–5 repeat, up to 3 attempts total
-   (`MAX_RETRAIN_ATTEMPTS` in `app.py`) — whichever attempt's result is used, balanced
-   or not, becomes final; the response's `retrain_attempts` and
-   `feature_selection.dropped_for_rebalancing` show what happened, and
+   percentage so it scales with feature count. If not balanced, the next attempt
+   keeps only the top `ceil(current_feature_count * BALANCE_SHRINK_FACTOR)`
+   features, with a `MIN_BALANCE_FEATURES` floor, then repeats steps 3–5 up to
+   `MAX_RETRAIN_ATTEMPTS` in `app.py`. Whichever attempt's result is used,
+   balanced or not, becomes final; the response's `retrain_attempts` and
+   `feature_selection.dropped_for_rebalancing` show what was pruned, and
    `covariate_balance.n_features_over_threshold` /
    `covariate_balance.max_unbalanced_features_allowed` show exactly how close (or far)
    the final attempt came.

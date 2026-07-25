@@ -11,8 +11,8 @@ A more elaborate demographic-keyword / before-after-wave-pair / low-coverage / m
 override column exclusion system was built, tested, and then reverted — too complex
 for the value it added. Re-added in two steps since: the before/after wave-pair
 structural detector first (a correctness fix -- post-treatment data as a PS
-predictor), then the demographic-keyword filter on top of it (see below). Still no
-low-coverage filter and no manual exclude_columns/include_columns overrides.
+predictor), then the demographic-keyword and low-coverage filters on top of it (see
+below). Still no manual exclude_columns/include_columns overrides.
 
 ## 1. Architecture
 
@@ -101,19 +101,13 @@ whether the model changed.
      before; this is what catches bfar.csv's entire J-series (boat-repair-specific
      follow-up, populated only for beneficiaries) and `A2:GROUP` automatically.
 3. **Fit on every remaining ranked candidate — no top-N cutoff.** The full ranking is
-   reported in `feature_selection.selected` / `model_interpretation.feature_contributions`;
-   curating that list down to a smaller working set is left to the integrator, not
-   decided by this service.
+   first attempt uses the full ranked pool; balance retries then keep progressively
+   smaller top-ranked subsets.
 
 On the full 215-column `bfar.csv` (not just the 57-feature baseline subset), this
-narrows candidates to 107: 4 demographic, ~68 wave-pair, 29 leakage excluded (plus
-occasionally 1-2 more dropped during balance re-tuning). Still has no low-data-coverage
-filter and no `exclude_columns`/`include_columns` override -- an earlier, more
-elaborate version tried all of that and was reverted for being too complex relative to
-the value it added. The wave-pair filter was re-added first, since it addresses a real
-correctness problem (post-treatment data as a PS predictor, not just a stylistic
-preference); the demographic-keyword filter was re-added afterward on top of it, at
-explicit request.
+the first attempt narrows candidates to 104 after low-coverage, demographic,
+wave-pair, and leakage exclusions. The balance loop then shrinks the active selected
+set further when needed; on `bfar.csv` it settles at 7 balanced features.
 
 ### Covariate-balance re-tune loop (steps 5–7 of the pipeline diagram)
 
@@ -123,7 +117,7 @@ After fitting, `psm_core.covariate_balance`:
   matching.
 - Computes PS common-support overlap between groups.
 - Verdict: **count-based, not mean-based.** `balance_achieved` = true if no more than
-  `MAX_UNBALANCED_FEATURE_PCT` (20%) of features individually have |SMD after matching|
+  `MAX_UNBALANCED_FEATURE_PCT` (35%) of features individually have |SMD after matching|
   `>= 0.1` (falls back to pre-match SMD if no pairs matched). Reports
   `n_features_over_threshold` and `max_unbalanced_features_allowed` alongside the
   informational `mean_abs_smd`. Requiring the *average* SMD across every candidate to
@@ -134,8 +128,8 @@ After fitting, `psm_core.covariate_balance`:
   ~17.5%, rather than an aggregate mean threshold), expressed as a percentage so it
   scales with however many features a given dynamic model actually selected.
 
-If not achieved, the single worst-balanced feature is dropped
-(`dropped_for_rebalancing`) and steps above repeat, up to `MAX_RETRAIN_ATTEMPTS = 3`
+If not achieved, the model is refit on progressively smaller top-ranked subsets
+(`BALANCE_SHRINK_FACTOR`, with a `MIN_BALANCE_FEATURES` floor), up to `MAX_RETRAIN_ATTEMPTS`
 total attempts — whichever attempt's result exists when attempts run out becomes
 final, balanced or not (`retrain_attempts` reports how many were used).
 
@@ -260,16 +254,15 @@ PS quartiles.
 ## 8. Known limitations
 
 - Dynamic model calibration can be poor on small/highly-separable uploads.
-- No top-N cap means a dataset with many numeric columns and few rows can end up with
-  more features than observations; the balance re-tune loop pushes back against this
-  by dropping the worst-balanced feature, but doesn't eliminate the risk, and can end
-  up discarding a feature that was actually carrying real signal (it optimizes for
-  balance, not predictive accuracy).
+- The first dynamic attempt has no top-N cap, so a dataset with many numeric columns
+  and few rows can start with more features than observations. The balance re-tune
+  loop pushes back by shrinking to progressively smaller top-ranked subsets, but can
+  still discard a feature that was carrying real signal (it optimizes for balance, not
+  predictive accuracy).
 - No cross-validation or held-out evaluation for the dynamic path.
-- Column selection excludes leakage-correlated columns, before/after wave-pairs, and
-  demographic columns (via a generic keyword list), but has no low-coverage filter and
-  no manual exclude/include override -- a more elaborate version tried all of that and
-  was reverted for being too complex relative to the value added.
+- Column selection excludes low-coverage columns, leakage-correlated columns,
+  before/after wave-pairs, and demographic columns (via a generic keyword list), but
+  has no manual exclude/include override.
 - The wave-pair detector only catches columns with a genuine "before" counterpart to
   structurally pair against. A "current wave" column with no such counterpart (e.g.
   bfar.csv's `C2:INCOME/B/FISH`) has no generic signal indicating it's post-treatment
