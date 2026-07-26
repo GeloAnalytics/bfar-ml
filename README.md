@@ -7,8 +7,8 @@ app in a background thread, started together by `python app.py`:
 | | Static | Dynamic |
 |---|---|---|
 | **Port** | `STATIC_PORT` (default `8001`) | `PORT` (default `8000`) |
-| **Trigger** | Every request | Request covers all 57 raw bfar.csv columns falls back to baseline; anything else uses the trained dynamic model |
-| **Model** | `models/best_model.pkl` -- frozen, produced by `build_model.py` | Baseline (see left) or whatever `POST /train` last produced |
+| **Trigger** | Every request | Every request -- always the current dynamic model, never the baseline (see below) |
+| **Model** | `models/best_model.pkl` -- frozen, produced by `build_model.py` | Whatever `POST /train` last produced (top 30 features or fewer) |
 | **`/train` endpoint?** | No -- baseline-only, rejects requests missing any of the 57 features (`409`) | Yes |
 | **Retrained on upload?** | Never | Every `/train` call, *unless* the upload's column set exactly matches whatever last trained the active model (see below) |
 | **Persisted?** | Yes, committed to the repo | Yes, `models/dynamic/` (gitignored runtime state) |
@@ -16,28 +16,32 @@ app in a background thread, started together by `python app.py`:
 The dynamic model works **Teachable-Machine style**: every `POST /train` call with a
 new column set deletes whatever model is currently active and trains a completely
 fresh one on the new upload -- ranking every usable column by feature importance and
-fitting on all of them on the first attempt, no top-N cap and no merging with the previous schema. Before
-ranking, candidates are narrowed by three filters (each reported separately in
-`feature_selection`): a demographic/respondent-identity keyword match (generic survey
-terms like age, sex, area, education -- not tied to any one program's naming scheme;
+fitting on exactly the top 30 of that ranking (`TOP_N_FEATURES`; fewer only if the
+dataset has fewer than 30 surviving candidates to begin with), no merging with the
+previous schema. Before ranking, candidates are narrowed by four filters (each
+reported separately in `feature_selection`): low data coverage (fewer than 10%
+non-null values in this particular upload -- dataset-agnostic, no naming
+assumptions), a demographic/respondent-identity keyword match (generic survey terms
+like age, sex, area, education -- not tied to any one program's naming scheme;
 household size is deliberately kept, treated as livelihood-adjacent rather than
 demographic), a before/after wave-pair structural match (a column that's the "current"
 half of a pair sharing an identical name except for one A/B token -- confirmed against
 the actual BFAR beneficiary questionnaire's baseline/endline design; a structural
 pattern, not a hardcoded word list, so it generalizes across similar before/after
-survey designs), and leakage correlation with treatment. The full ranking of what
-survives is used as the starting point for the balance loop. If the uploaded CSV's columns
-exactly match the columns of whatever dataset trained the currently active model,
-training is skipped entirely and the existing model is reused as-is (`retrained: false`
-in the response) -- only re-scored against the new upload. See `DYNAMIC_TRAINING.md`
-for the full design and why this replaced an earlier
-index-mapping approach.
+survey designs), and leakage correlation with treatment. Whatever ranked below the
+top-30 cutoff is reported as `feature_selection.excluded_as_below_top_n` -- it's not
+adjusted based on the covariate-balance result below, so the same upload always
+produces the same feature-set size. If the uploaded CSV's columns exactly match the
+columns of whatever dataset trained the currently active model, training is skipped
+entirely and the existing model is reused as-is (`retrained: false` in the response)
+-- only re-scored against the new upload. See `DYNAMIC_TRAINING.md` for the full
+design and why this replaced an earlier index-mapping approach.
 
-If covariate balance isn't achieved after fitting -- more than 35% of features
-individually have |SMD| across matched pairs `>= 0.1` (count-based, not a mean
-threshold across all features) -- `/train` automatically retries on progressively
-smaller top-ranked feature sets, down to at least 5 features or up to 15 attempts, before finalizing -- see
-`covariate_balance` in the response and `psm_core.covariate_balance`.
+Covariate balance is computed and reported on whatever this fixed-size model actually
+produces (see `covariate_balance` in the response and `psm_core.covariate_balance`) --
+`balance_achieved` can honestly come out `false` on a dataset whose 30-feature model
+doesn't clear the bar; it's reported as-is rather than chased by shrinking the feature
+count further.
 
 Both always start together (one process, `python app.py`) -- there's no flag to run
 just one, but each is an independent Flask server on its own port, so callers only
@@ -72,7 +76,7 @@ STATIC_PORT=8001
 **Error contract.** Every endpoint returns JSON with the same shape:
 - `200` -- success, body is the endpoint-specific payload documented below.
 - `400` -- bad/incomplete input (unparsable CSV, no treatment column found, dataset too small, missing required feature columns, ...): `{"error": "<message>"}` -- shown-to-user quality, never a stack trace.
-- `409` -- a scoring endpoint was called but no model applies: the request doesn't cover all 57 baseline features, and nothing has been trained yet. `{"error": "no dynamic model trained yet, ..."}`.
+- `409` -- a dynamic-port scoring endpoint was called before anything's been trained: `{"error": "no dynamic model trained yet -- POST a CSV to /train first"}`. On the static port, a `409` instead means the request is missing one of the 57 required baseline features.
 - `500` -- baseline artifacts failed to load at startup: `{"error": "ML artifacts not loaded: <reason>"}`. Ops problem, not user-input problem -- alert on it.
 
 **CORS.** `CORS(app)` currently allows any origin -- fine for local development; if a
@@ -94,9 +98,10 @@ plus `POST /predict_ps`, `POST /estimate_att`, and `POST /predict_ps_batch` **wi
 the `/train` prefix -- no `/train` endpoint at all. Every request must cover all 57
 baseline features or it gets a `409`; `source` in the response is always `"baseline"`.
 
-**Response fields:** all three scoring endpoints report `source` (`"baseline"` or
-`"dynamic"`, telling you which model actually served the request) and
-`n_features_used`.
+**Response fields:** all three scoring endpoints report `source` and
+`n_features_used`. On the dynamic port `source` is always `"dynamic"`; on the static
+port it's always `"baseline"` -- these are two separate, fixed pipelines now, not a
+per-request choice.
 
 **Running in production.** `app.run(...)` is Flask's dev server -- put a real WSGI
 server in front. `app.py` exposes two module-level Flask objects, `app` (dynamic) and
@@ -165,7 +170,7 @@ After a `/train` call, `dynamic` instead looks like:
   "trained_at": 1752566400.0,
   "treatment_column": "enrolled",
   "treatment_detection_method": "binary_value",
-  "n_features_selected": 27,
+  "n_features_selected": 30,
   "top_features": [{"feature": "monthly_income", "importance": 0.11}, "..."]
 }
 ```
@@ -177,26 +182,27 @@ curl -X POST http://localhost:8000/train -F "file=@mydataset.csv"
 Optional form field: `treatment_column=enrolled_flag` (bypasses auto-detection).
 
 **If the uploaded CSV's column set exactly matches the columns that trained the
-currently active model, retraining is skipped** (`retrained: false`) and that model is
-just re-scored against this upload. Otherwise it deletes whatever dynamic model is
-currently active and trains a completely fresh one -- ranks every usable numeric
-column by importance for predicting the detected treatment column, after excluding
-(1) demographic/respondent-identity columns (a generic keyword match -- age, sex,
-area, education, etc.), (2) before/after wave-pair columns (a column that's the
-"current" half of a pair sharing an identical name except for one A/B token), and (3)
-near-perfect treatment proxies, then fits on **all** that remain on the first attempt
--- no top-N cap. If covariate balance isn't achieved, it retries on progressively
-smaller top-ranked feature sets until balance is achieved, it reaches 5 features, or
-15 attempts have run (see `retrain_attempts`). `feature_selection.selected` reports
-the final selected feature set, and `feature_selection.dropped_for_rebalancing`
-reports features pruned by that balance search. Nothing carries over from any previous `/train` call
-that actually retrained.
+currently active model, retraining is skipped** (`retrained: false`, `retrain_attempts: 0`)
+and that model is just re-scored against this upload. Otherwise it deletes whatever
+dynamic model is currently active and trains a completely fresh one (`retrain_attempts: 1`)
+-- ranks every usable numeric column by importance for predicting the detected
+treatment column, after excluding (1) low-coverage columns (fewer than 10% non-null
+values in this upload), (2) demographic/respondent-identity columns (a generic
+keyword match -- age, sex, area, education, etc.), (3) before/after wave-pair columns
+(a column that's the "current" half of a pair sharing an identical name except for
+one A/B token), and (4) near-perfect treatment proxies, then fits on exactly the
+**top 30** of what remains (`TOP_N_FEATURES`; fewer only if fewer than 30 candidates
+survive the four filters). This count is fixed -- it does not change based on the
+covariate-balance result. `feature_selection.selected` reports the final selected
+feature set, and `feature_selection.excluded_as_below_top_n` reports whatever ranked
+below the top-30 cutoff. Nothing carries over from any previous `/train` call that
+actually retrained.
 
 **Two independent counts, don't confuse them:** `rows` / `ps_output.n_rows_scored` is
 the number of *respondents* -- one propensity score per row, period, regardless of
 feature count. `feature_selection.n_features_selected` /
 `model_interpretation.n_features_ranked` is the number of *predictor columns* used --
-unrelated to row count. Seeing different numbers here (e.g. 412 rows but 27 features)
+unrelated to row count. Seeing different numbers here (e.g. 412 rows but 30 features)
 is expected, not a bug.
 ```json
 {
@@ -207,12 +213,13 @@ is expected, not a bug.
   "treatment_column": "enrolled",
   "treatment_detection_method": "binary_value",
   "feature_selection": {
-    "n_features_selected": 27,
+    "n_features_selected": 30,
     "selected": [{"feature": "monthly_income", "importance": 0.11}, "..."],
     "excluded_as_leakage": ["group_assignment_code"],
     "excluded_as_wave_pair": ["assets_endline_motorcycle"],
     "excluded_as_context": ["respondent_age", "respondent_sex"],
-    "dropped_for_rebalancing": []
+    "excluded_as_low_coverage": ["field_notes"],
+    "excluded_as_below_top_n": ["distance_to_market", "..."]
   },
   "ps_output": {
     "n_rows_scored": 412,
@@ -236,12 +243,12 @@ is expected, not a bug.
   },
   "model_interpretation": {
     "method": "SHAP (shap.TreeExplainer, exact for tree-ensemble models) ...",
-    "n_features_ranked": 27,
+    "n_features_ranked": 30,
     "feature_contributions": [
       {"feature": "monthly_income", "mean_abs_shap": 0.34, "mean_shap": 0.21, "direction": "increases_likelihood"}, "..."
     ],
     "socioeconomic_insights": [
-      "Feature #1 of 5 shown (ranked by SHAP contribution to the propensity-score model, out of 27 features total) -- column \"monthly_income\": higher values in this column are associated with a higher likelihood of being in the treatment group. (This describes one input column, not an individual respondent.)",
+      "Feature #1 of 5 shown (ranked by SHAP contribution to the propensity-score model, out of 30 features total) -- column \"monthly_income\": higher values in this column are associated with a higher likelihood of being in the treatment group. (This describes one input column, not an individual respondent.)",
       "..."
     ]
   },
@@ -254,7 +261,7 @@ groups, and a `balance_achieved` verdict. That verdict is now overall: it can pa
 either the matched-pairs check or the IPW reweighted check clears the same
 count-based bar. The matched-pairs result is still reported separately as
 `matched_balance_achieved`, and the IPW result lives under `covariate_balance.ipw`.
-The count-based bar is true if no more than 35% of features
+The count-based bar is true if no more than 20% of features
 (`max_unbalanced_features_allowed`) individually exceed |SMD| `>= 0.1`
 (`n_features_over_threshold`), not a requirement that the *average* across every
 feature stays low -- `psm_core.covariate_balance`. `model_interpretation` (step 9) is real SHAP values
@@ -275,7 +282,7 @@ curl -X POST http://localhost:8000/train/predict_ps \
   -d '{ "records": [ { "monthly_income": 8000, "household_size": 4, "...": 0 } ] }'
 ```
 ```json
-{ "ps_final": [0.42], "source": "dynamic", "n_features_used": 27 }
+{ "ps_final": [0.42], "source": "dynamic", "n_features_used": 30 }
 ```
 Always scores against whichever dynamic model `POST /train` most recently produced
 (`source: "dynamic"`, top 30 features or fewer) -- never the frozen 57-feature
