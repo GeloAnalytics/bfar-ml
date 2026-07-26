@@ -3,7 +3,6 @@ from flask_cors import CORS
 from dotenv import load_dotenv
 import os
 import json
-import math
 import socket
 import threading
 import time
@@ -101,31 +100,25 @@ STATE = {
     "excluded_as_wave_pair": None,
     "excluded_as_context": None,
     "excluded_as_low_coverage": None,
-    "dropped_for_rebalancing": None,
+    "excluded_as_below_top_n": None,
 }
 
 MIN_TRAINING_ROWS = 10
-# First attempt ranks and fits on every non-leakage-correlated numeric candidate
-# column, no cap. If that doesn't reach covariate balance, subsequent attempts
-# shrink to progressively fewer top-ranked features (see BALANCE_SHRINK_FACTOR
-# below) rather than trying the full set every time.
-TOP_N_FEATURES = None
-# On a failed balance check, the next attempt re-ranks and keeps only the top
-# ceil(current_feature_count * BALANCE_SHRINK_FACTOR) features (floor
-# MIN_BALANCE_FEATURES), then re-fits and re-checks -- exponential-decay search
-# for the smallest-necessary covariate set that actually reaches genuine balance,
-# rather than a fixed magic number tuned to one dataset. Matching only guarantees
-# balance on the scalar propensity score, not on every individual covariate it
-# was built from -- with 100+ candidate columns and a four-figure row count,
-# empirically most of them stay individually unbalanced after matching no matter
-# how loose the tolerance is (verified against bfar.csv: 65-74 of ~104 features
-# stay over threshold at any tolerance), so cutting dimensionality is what
-# actually fixes it, not a looser bar. 0.7 (30% cut per failed attempt) converges
-# bfar.csv to genuine balance in ~9 attempts (104 -> 7 features); MAX_RETRAIN_ATTEMPTS
-# below gives headroom for larger candidate sets on other datasets.
-BALANCE_SHRINK_FACTOR = 0.7
-MIN_BALANCE_FEATURES = 5
-MAX_RETRAIN_ATTEMPTS = 15
+# Fixed retained count: whatever survives the four column filters in
+# psm_core._rank_candidate_features (low-coverage, demographic/context,
+# wave-pair, leakage) is ranked by importance, and exactly the top 30 of that
+# ranking are used to fit the model -- fewer only if the dataset has fewer
+# than 30 surviving candidates to begin with (ranked[:30] on a shorter list
+# just returns all of it). This count is NOT adjusted based on the
+# covariate-balance result (deliberately -- an earlier version shrank the
+# feature count on a failed balance check, but the count itself needs to stay
+# a stable, predictable 30 instead). balance_achieved is just reported as
+# whatever it comes out to at this fixed size; on bfar.csv specifically, that
+# is currently False at n=30 (verified: 18/30 features over threshold on the
+# matched check, 8/30 on the IPW check, tolerance allows 6) -- the caller sees
+# an honest balance_achieved: false rather than the count being quietly
+# shrunk to force a passing verdict.
+TOP_N_FEATURES = 30
 
 
 def load_state():
@@ -245,31 +238,29 @@ def train():
     hardcoded word list, so it generalizes to other before/after-design
     datasets, not just bfar.csv; (3) near-perfect correlation with treatment
     (psm_core._leakage_correlated_columns). Whatever survives all three gets
-    ranked by importance and fit on in full on the first attempt -- no top-N
-    cap (psm_core.select_top_features, psm_core.train_psm_model). The final
-    selected feature set ships in the response (feature_selection.selected /
-    model_interpretation.feature_contributions). If covariate balance isn't achieved (more than
-    MAX_UNBALANCED_FEATURE_PCT of features individually have |SMD| after
-    matching >= 0.1 -- a count-based tolerance, not a mean-based gate, see
-    psm_core.covariate_balance), training retries on progressively fewer
-    top-ranked features (BALANCE_SHRINK_FACTOR-decayed, floor
-    MIN_BALANCE_FEATURES) only if neither the matched-pairs check nor the IPW
-    reweighted check reaches balance. Matching only guarantees balance on the
-    scalar propensity score, not on every individual covariate, so the IPW
-    pass gets a chance to accept a much larger feature set before shrinking the
-    model further. feature_selection.dropped_for_rebalancing lists whatever
-    didn't make the final, balance-achieving cut.
+    ranked by importance; exactly the top TOP_N_FEATURES (30) of that ranking
+    are used to fit the model, fewer only if the dataset has fewer than 30
+    surviving candidates (psm_core.select_top_features, psm_core.train_psm_model).
+    This count is fixed -- it is NOT adjusted based on the covariate-balance
+    result, so the same upload always produces the same feature-set size.
+    feature_selection.excluded_as_below_top_n lists whatever ranked below the
+    cut. covariate_balance is computed and reported on whatever this fixed-size
+    model actually produces (see psm_core.covariate_balance): balance_achieved
+    is true if EITHER the matched-pairs check or the IPW-reweighted check
+    passes at that size (matched_balance_achieved isolates the matched-only
+    signal) -- it can honestly come out false, and that's reported as-is
+    rather than being chased by shrinking the feature count further.
 
     Response includes, alongside the trained-model summary: feature_selection
-    (selected features + what got excluded and why), ps_output (in-sample
-    propensity scores for this upload), covariate_balance (SMD before/after
-    matching, PS overlap, balance_achieved verdict, plus an `ipw` block --
-    the same balance reweighted across the whole sample instead of restricted
-    to matched pairs, reported for context only, does not affect
-    balance_achieved -- see psm_core.covariate_balance), model_interpretation
-    (real SHAP values via shap.TreeExplainer -- mean |SHAP value| per feature
-    plus plain-language socioeconomic_insights), and decision_support
-    (PS-quartile table).
+    (selected features + what got excluded and why, including
+    excluded_as_below_top_n), ps_output (in-sample propensity scores for this
+    upload), covariate_balance (SMD before/after matching, PS overlap,
+    balance_achieved verdict, plus an `ipw` block -- the same balance
+    reweighted across the whole sample instead of restricted to matched pairs;
+    see psm_core.covariate_balance for how it factors into balance_achieved),
+    model_interpretation (real SHAP values via shap.TreeExplainer -- mean
+    |SHAP value| per feature plus plain-language socioeconomic_insights), and
+    decision_support (PS-quartile table).
 
     /train/predict_ps, /train/estimate_att, /train/predict_ps_batch score
     against whichever model currently applies: the frozen baseline if the
@@ -316,7 +307,7 @@ def train():
         excluded_wave_pair = STATE.get("excluded_as_wave_pair") or []
         excluded_context = STATE.get("excluded_as_context") or []
         excluded_low_coverage = STATE.get("excluded_as_low_coverage") or []
-        dropped_for_rebalancing = STATE.get("dropped_for_rebalancing") or []
+        excluded_below_top_n = STATE.get("excluded_as_below_top_n") or []
         retrain_attempts = 0
     else:
         try:
@@ -326,32 +317,19 @@ def train():
         if treatment_col is None:
             return jsonify({"error": "could not auto-detect a treatment/control column in this dataset; retry with a 'treatment_column' form field"}), 400
 
-        current_top_n = TOP_N_FEATURES
-        initial_top_features = None
-        model, top_features, final_importances = None, None, None
-        excluded_leakage, excluded_wave_pair, excluded_context, excluded_low_coverage = None, None, None, None
-        balance = None
-        for attempt in range(1, MAX_RETRAIN_ATTEMPTS + 1):
-            retrain_attempts = attempt
-            try:
-                top_features, final_importances, excluded_leakage, excluded_wave_pair, excluded_context, excluded_low_coverage = core.select_top_features(
-                    df, treatment_col, treatment_binarized, top_n=current_top_n)
-                model, _ = core.train_psm_model(df, treatment_binarized, top_features)
-            except ValueError as e:
-                return jsonify({"error": str(e)}), 400
-            if initial_top_features is None:
-                initial_top_features = top_features
+        try:
+            top_features, final_importances, excluded_leakage, excluded_wave_pair, excluded_context, excluded_low_coverage = core.select_top_features(
+                df, treatment_col, treatment_binarized, top_n=TOP_N_FEATURES)
+            model, _ = core.train_psm_model(df, treatment_binarized, top_features)
+        except ValueError as e:
+            return jsonify({"error": str(e)}), 400
+        retrain_attempts = 1
 
-            ps, _X = _score("dynamic", model, top_features, None, df)
-            balance = core.covariate_balance(df, treatment_binarized, top_features, core.logit(ps))
-            if balance["balance_achieved"] or attempt == MAX_RETRAIN_ATTEMPTS:
-                break
-            next_n = max(MIN_BALANCE_FEATURES, math.ceil(len(top_features) * BALANCE_SHRINK_FACTOR))
-            if next_n >= len(top_features):
-                break  # can't shrink further -- give up with whatever this attempt has
-            current_top_n = next_n
-
-        dropped_for_rebalancing = sorted(set(initial_top_features) - set(top_features))
+        # Every filtered candidate ranks into final_importances regardless of the
+        # TOP_N_FEATURES cap (see psm_core.select_top_features) -- whatever ranked
+        # below the cut is what "below top n" means here, distinct from the four
+        # exclusion categories above (those never entered the ranking at all).
+        excluded_below_top_n = sorted(set(final_importances.keys()) - set(top_features))
 
         STATE.update({
             "model": model,
@@ -368,7 +346,7 @@ def train():
             "excluded_as_wave_pair": excluded_wave_pair,
             "excluded_as_context": excluded_context,
             "excluded_as_low_coverage": excluded_low_coverage,
-            "dropped_for_rebalancing": dropped_for_rebalancing,
+            "excluded_as_below_top_n": excluded_below_top_n,
         })
         save_state()
 
@@ -405,7 +383,7 @@ def train():
             "excluded_as_wave_pair": excluded_wave_pair,
             "excluded_as_context": excluded_context,
             "excluded_as_low_coverage": excluded_low_coverage,
-            "dropped_for_rebalancing": dropped_for_rebalancing,
+            "excluded_as_below_top_n": excluded_below_top_n,
         },
         # ps_output describes ROWS/RESPONDENTS -- one propensity score per row
         # of the uploaded CSV. len(ps) == len(ps_logit) == n_rows_scored ==
