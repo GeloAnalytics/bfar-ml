@@ -83,7 +83,7 @@ except Exception as e:
 STATE_DIR = os.environ.get("ML_DYNAMIC_STATE_DIR", os.path.join(os.path.dirname(__file__), "models", "dynamic"))
 STATE_MODEL_PATH = os.path.join(STATE_DIR, "model.pkl")
 STATE_META_PATH = os.path.join(STATE_DIR, "meta.json")
-DYNAMIC_TRAINING_VERSION = 3
+DYNAMIC_TRAINING_VERSION = 4
 
 STATE = {
     "model": None,
