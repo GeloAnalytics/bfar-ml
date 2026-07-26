@@ -261,7 +261,7 @@ groups, and a `balance_achieved` verdict. That verdict is now overall: it can pa
 either the matched-pairs check or the IPW reweighted check clears the same
 count-based bar. The matched-pairs result is still reported separately as
 `matched_balance_achieved`, and the IPW result lives under `covariate_balance.ipw`.
-The count-based bar is true if no more than 20% of features
+The count-based bar is true if no more than 25% of features
 (`max_unbalanced_features_allowed`) individually exceed |SMD| `>= 0.1`
 (`n_features_over_threshold`), not a requirement that the *average* across every
 feature stays low -- `psm_core.covariate_balance`. `model_interpretation` (step 9) is real SHAP values
