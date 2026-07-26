@@ -146,12 +146,14 @@ load_state()
 
 
 def _resolve_scoring_model(df):
-    """All 57 raw baseline features present -> the frozen baseline (most
-    accurate, always available, needs no training). Otherwise whatever's
-    currently in STATE, or (None, None, None, None) if nothing has been
-    trained yet."""
-    if ALL_FEATURES is not None and all(f in df.columns for f in ALL_FEATURES):
-        return BASELINE_MODEL, ALL_FEATURES, BASELINE_SCALER, "baseline"
+    """Always whatever's currently in STATE -- the dynamic model most
+    recently produced by POST /train (top 30 features or fewer, see
+    TOP_N_FEATURES) -- or (None, None, None, None) if nothing has been
+    trained yet. Deliberately never falls back to the frozen 57-feature
+    baseline here even if a request happens to cover all 57 raw columns:
+    that silently scored against a model with no relation to what /train
+    just produced. The frozen baseline is still served, unconditionally, by
+    static_app on its own port -- this is the dynamic app's resolver only."""
     if STATE["model"] is not None:
         return STATE["model"], STATE["feature_cols"], None, "dynamic"
     return None, None, None, None
@@ -171,11 +173,8 @@ def _score(source, model, feature_cols, scaler, df):
     return ps, X
 
 
-def _no_model_error(df):
-    total = len(ALL_FEATURES) if ALL_FEATURES else "?"
-    n_covered = len(set(df.columns) & set(ALL_FEATURES)) if ALL_FEATURES else 0
-    return (f"no dynamic model trained yet, and this dataset covers only {n_covered}/{total} baseline "
-            f"features -- POST a CSV to /train first, or include all {total} baseline features")
+def _no_model_error():
+    return "no dynamic model trained yet -- POST a CSV to /train first"
 
 
 def _missing_features_error(df):
@@ -428,9 +427,10 @@ def predict_ps():
     """
     JSON body: { "records": [ { "<column_name>": value, ... }, ... ] }
 
-    Scores against the frozen baseline if every record covers all 57 raw
-    bfar features, otherwise against whatever's currently in the dynamic
-    model (see POST /train). 409 if neither applies.
+    Scores against whichever dynamic model POST /train most recently
+    produced (top 30 features or fewer) -- never the frozen 57-feature
+    baseline, even if a record happens to cover all 57 raw columns (see
+    _resolve_scoring_model). 409 if nothing has been trained yet.
     """
     body = request.get_json(force=True, silent=True) or {}
     records = body.get("records")
@@ -440,7 +440,7 @@ def predict_ps():
 
     model, feature_cols, scaler, source = _resolve_scoring_model(df)
     if model is None:
-        return jsonify({"error": _no_model_error(df)}), 409
+        return jsonify({"error": _no_model_error()}), 409
 
     missing = [f for f in feature_cols if f not in df.columns]
     if missing:
@@ -479,7 +479,7 @@ def estimate_att():
 
     model, feature_cols, scaler, source = _resolve_scoring_model(df)
     if model is None:
-        return jsonify({"error": _no_model_error(df)}), 409
+        return jsonify({"error": _no_model_error()}), 409
 
     missing = [f for f in feature_cols if f not in df.columns]
     if missing:
@@ -526,7 +526,7 @@ def predict_ps_batch():
 
     model, feature_cols, scaler, source = _resolve_scoring_model(df)
     if model is None:
-        return jsonify({"error": _no_model_error(df)}), 409
+        return jsonify({"error": _no_model_error()}), 409
 
     missing = [f for f in feature_cols if f not in df.columns]
     if missing:

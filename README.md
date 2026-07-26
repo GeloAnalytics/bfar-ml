@@ -277,10 +277,10 @@ curl -X POST http://localhost:8000/train/predict_ps \
 ```json
 { "ps_final": [0.42], "source": "dynamic", "n_features_used": 27 }
 ```
-Scores against the frozen baseline (`source: "baseline"`) if every record covers all
-57 raw bfar features; otherwise against whatever's currently in the dynamic model
-(`source: "dynamic"`). `409` if neither applies -- train first, or include all 57
-baseline features.
+Always scores against whichever dynamic model `POST /train` most recently produced
+(`source: "dynamic"`, top 30 features or fewer) -- never the frozen 57-feature
+baseline, even if a record happens to cover all 57 raw columns. `409` if nothing has
+been trained yet.
 
 ### Predict propensity scores + decision support (whole CSV)
 ```bash

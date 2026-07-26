@@ -88,13 +88,8 @@
   </select>
   <button id="trainBtn">Train</button>
   <div id="trainStatus" class="status"></div>
+  <p class="muted">Training already scores every row of this same upload -- see <code>ps_output</code> in the response below; no separate scoring step needed.</p>
   <pre id="trainOut">(no response yet)</pre>
-
-  <h3>1b. Score this same dataset against the current model</h3>
-  <p class="muted">Reuses the CSV file picked above -- no need to upload it again.</p>
-  <button id="scoreBtn">Score (predict_ps_batch)</button>
-  <div id="scoreStatus" class="status"></div>
-  <pre id="scoreOut">(no response yet)</pre>
 </div>
 
 <script>
@@ -179,41 +174,6 @@ document.getElementById("trainBtn").addEventListener("click", async () => {
       status.textContent = `Trained on ${body.rows} rows -- treatment column "${body.treatment_column}" (${body.treatment_detection_method}), ${body.n_features_selected} features selected.`;
       status.className = "status ok";
       loadHealth();
-    } else {
-      status.textContent = `Error (${res.status}): ${body.error || "unknown"}`;
-      status.className = "status err";
-    }
-  } catch (e) {
-    status.textContent = "Request failed: " + e.message;
-    status.className = "status err";
-  }
-});
-
-document.getElementById("scoreBtn").addEventListener("click", async () => {
-  const fileInput = document.getElementById("trainFile");
-  const status = document.getElementById("scoreStatus");
-  const out = document.getElementById("scoreOut");
-
-  if (!fileInput.files.length) {
-    status.textContent = "Pick a CSV file first.";
-    status.className = "status err";
-    return;
-  }
-
-  const form = new FormData();
-  form.append("file", fileInput.files[0]);
-
-  status.textContent = "Scoring...";
-  status.className = "status";
-  out.textContent = "";
-
-  try {
-    const res = await fetch(`${API_BASE}/train/predict_ps_batch`, { method: "POST", body: form });
-    const body = await res.json();
-    out.textContent = JSON.stringify(body, null, 2);
-    if (res.ok) {
-      status.textContent = `Scored ${body.rows} rows using the "${body.source}" model (${body.n_features_used} features).`;
-      status.className = "status ok";
     } else {
       status.textContent = `Error (${res.status}): ${body.error || "unknown"}`;
       status.className = "status err";

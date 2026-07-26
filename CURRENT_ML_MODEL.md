@@ -221,9 +221,10 @@ new dependency (`requirements.txt`).
 ## 5. Scoring (`/train/predict_ps`, `/train/estimate_att`, `/train/predict_ps_batch`,
    and their static-port equivalents without the `/train` prefix)
 
-Unchanged logic from before, only the dynamic-port paths moved. Resolve which model
-applies (baseline if all 57 features present, else dynamic, else `409`), impute/score,
-return propensity scores. `/estimate_att` (`psm_core.matched_att`, now built on the
+Dynamic-port paths always resolve to whichever dynamic model `/train` most recently
+produced (never the frozen baseline, even if a request covers all 57 raw columns;
+`409` if nothing has been trained yet). Static-port equivalents remain baseline-only,
+unconditionally, on their own port. `/estimate_att` (`psm_core.matched_att`, built on the
 shared `psm_core._match_pairs` helper) does 1-NN caliper matching + paired t-test +
 bootstrap CI. `/predict_ps_batch` (`psm_core.decision_support_table`) stratifies into
 PS quartiles.
