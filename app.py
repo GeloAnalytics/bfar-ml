@@ -280,6 +280,7 @@ def train():
 
     uploaded_columns = sorted(df.columns)
     override_col = request.form.get("treatment_column") or None
+    override_outcome_col = request.form.get("outcome_column") or None
     retrain_skipped = (
         STATE["model"] is not None
         and STATE.get("training_version") == DYNAMIC_TRAINING_VERSION
@@ -365,6 +366,33 @@ def train():
     ]
     ranked_features = [{"feature": name, "importance": imp} for name, imp in ranked]
 
+    # Detect the outcome column for ATT estimation and profiling.
+    # The outcome column is the post-program measure of interest (e.g. income after the program).
+    # We use the override if provided, otherwise auto-detect (prefers C5:TOT_INCOME/B for BFAR data).
+    try:
+        outcome_col = core.detect_outcome_column(df, override_col=override_outcome_col)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+
+    pair_profiles = []
+    profiling_summary = {}
+    att_result = {}
+    matched_pairs_list = []
+    if outcome_col and outcome_col in df.columns:
+        outcomes = pd.to_numeric(df[outcome_col], errors="coerce").to_numpy(dtype=float)
+        att_res, _ = core.matched_att(ps_logit_arr, treatment_binarized.to_numpy(), outcomes)
+        if att_res:
+            pair_profiles = att_res.get("pair_profiles", [])
+            profiling_summary = att_res.get("profiling_summary", {})
+            att_result = {k: v for k, v in att_res.items() if k not in ("pair_profiles", "profiling_summary")}
+            # Extract raw (treated_idx, control_idx) tuples for wave-pair profiling
+            matched_pairs_list = [(p["treated_index"], p["control_index"]) for p in pair_profiles]
+
+    # Compute per-feature wave-pair profiling (pre-program vs post-program changes for
+    # both treated beneficiaries and their matched controls).
+    wave_pairs = core.find_wave_pairs(df)
+    profile_updates = core.compute_wave_pair_profiling(df, matched_pairs_list, wave_pairs)
+
     return jsonify({
         "status": "trained",
         "retrained": not retrain_skipped,
@@ -372,6 +400,7 @@ def train():
         "rows": len(df),
         "treatment_column": treatment_col,
         "treatment_detection_method": method,
+        "outcome_column": outcome_col,
         # feature_selection describes COLUMNS (which ones were used and why) --
         # its list lengths are feature counts, unrelated to how many rows were
         # uploaded. n_features_selected == len(selected), always.
@@ -400,6 +429,15 @@ def train():
             },
         },
         "covariate_balance": balance,
+        # att_result holds the ATT estimate (mean, CI, p-value, caliper) from matched_att.
+        # pair_profiles gives the per-matched-pair outcome details.
+        # profiling_summary gives the aggregate Increased/Decreased/No Change tally on the outcome column.
+        "att_result": att_result,
+        "pair_profiles": pair_profiles,
+        "profiling_summary": profiling_summary,
+        # profile_updates gives pre-post changes across ALL detected wave-pair columns
+        # for both the treated group and their matched controls -- the full life-update picture.
+        "profile_updates": profile_updates,
         # model_interpretation also describes COLUMNS, not rows: a ranking of
         # which features drove the model's predictions. n_features_ranked ==
         # len(feature_contributions), a completely different number from

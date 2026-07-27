@@ -541,13 +541,33 @@ def matched_att(ps_logit_final, treatments, outcomes, caliper_ratio=0.2, n_boots
             "ci_95": None,
             "p_value_paired_ttest": None,
             "caliper": json_safe_float(caliper),
+            "pair_profiles": [],
+            "profiling_summary": {
+                "increased_count": 0,
+                "decreased_count": 0,
+                "no_change_count": 0
+            }
         }, None
 
     diffs, treat_outs, ctrl_outs = [], [], []
+    pair_profiles = []
     for treat_idx, ctrl_idx in matched_pairs:
-        treat_outs.append(outcomes[treat_idx])
-        ctrl_outs.append(outcomes[ctrl_idx])
-        diffs.append(outcomes[treat_idx] - outcomes[ctrl_idx])
+        t_out = outcomes[treat_idx]
+        c_out = outcomes[ctrl_idx]
+        diff = t_out - c_out
+        treat_outs.append(t_out)
+        ctrl_outs.append(c_out)
+        diffs.append(diff)
+        
+        status = "Increased" if diff > 0 else ("Decreased" if diff < 0 else "No Change")
+        pair_profiles.append({
+            "treated_index": int(treat_idx),
+            "control_index": int(ctrl_idx),
+            "treated_outcome": json_safe_float(t_out),
+            "control_outcome": json_safe_float(c_out),
+            "outcome_difference": json_safe_float(diff),
+            "status": status
+        })
 
     diffs = np.asarray(diffs, dtype=float)
     att_mean = float(np.mean(diffs))
@@ -569,6 +589,12 @@ def matched_att(ps_logit_final, treatments, outcomes, caliper_ratio=0.2, n_boots
         "ci_95": [json_safe_float(ci_low), json_safe_float(ci_high)],
         "p_value_paired_ttest": json_safe_float(p_val),
         "caliper": json_safe_float(caliper),
+        "pair_profiles": pair_profiles,
+        "profiling_summary": {
+            "increased_count": int(sum(1 for p in pair_profiles if p["status"] == "Increased")),
+            "decreased_count": int(sum(1 for p in pair_profiles if p["status"] == "Decreased")),
+            "no_change_count": int(sum(1 for p in pair_profiles if p["status"] == "No Change")),
+        }
     }, None
 
 
@@ -790,3 +816,145 @@ def covariate_balance(df, treatment_binarized, feature_cols, ps_logit, caliper_r
         "worst_feature": feature_cols[worst_idx],
         "ipw": ipw_summary,
     }
+
+
+def detect_outcome_column(df, override_col=None):
+    """
+    Finds the outcome column in the dataframe.
+    If override_col is provided, verifies it exists and returns it.
+    Otherwise, checks for typical outcome columns:
+      - 'C5:TOT_INCOME/B' (BFAR standard outcome)
+      - 'outcome'
+      - 'income'
+      - 'total_income'
+      - Any column containing 'income' (case-insensitive) or 'outcome'
+    If none of these are found, returns the first column that isn't the treatment column
+    or an ID-like column.
+    """
+    if override_col is not None:
+        if override_col in df.columns:
+            return override_col
+        raise ValueError(f"outcome column '{override_col}' not found in dataset")
+
+    # Typical names
+    candidates = ["C5:TOT_INCOME/B", "outcome", "income", "total_income"]
+    for c in candidates:
+        if c in df.columns:
+            return c
+
+    # Search for case-insensitive matches
+    for col in df.columns:
+        col_lower = col.lower()
+        if "income" in col_lower or "outcome" in col_lower:
+            return col
+
+    # Fallback to the first numeric column that is not ID-like
+    for col in df.columns:
+        if pd.api.types.is_numeric_dtype(df[col]) and not _is_id_like(df[col], col):
+            # Also avoid columns with hints of treatment in their name
+            if not any(h in col.lower() for h in _TREATMENT_NAME_HINTS):
+                return col
+
+    return None
+
+
+def find_wave_pairs(df):
+    """
+    Scans all columns and pairs them using a prefix-stripping wave-pair matching heuristic.
+    For any column containing a standalone 'A' token (like 'C1:TOT_INCOME/A' or 'D1.2:A_MOTORC'),
+    it strips the section prefix (before the colon ':') and replaces 'A' with 'B' to search
+    for a matching wave 'B' column (like 'C5:TOT_INCOME/B' or 'D1.2:B_MOTORC').
+    """
+    parsed = []
+    for col in df.columns:
+        if ":" in col:
+            prefix, core_name = col.split(":", 1)
+        else:
+            prefix, core_name = "", col
+        parsed.append({"col": col, "prefix": prefix, "core": core_name})
+
+    pairs = []
+    for p_a in parsed:
+        if not _WAVE_PAIR_A_TOKEN.search(p_a["core"]):
+            continue
+        # Construct the target core name for wave B
+        target_core_b = _WAVE_PAIR_A_TOKEN.sub("B", p_a["core"], count=1)
+        for p_b in parsed:
+            if p_b["core"] == target_core_b:
+                pairs.append((p_a["col"], p_b["col"]))
+                break
+    return pairs
+
+
+def compute_wave_pair_profiling(df, matched_pairs, wave_pairs):
+    """
+    For each wave-pair (col_A, col_B), computes the pre-post profiling (Increased, Decreased, No Change)
+    for matched treated units and matched control units.
+    matched_pairs: list of (treated_idx, control_idx)
+    wave_pairs: list of (col_A, col_B)
+    """
+    results = []
+    if not matched_pairs or not wave_pairs:
+        return results
+
+    treated_idxs = [p[0] for p in matched_pairs]
+    control_idxs = [p[1] for p in matched_pairs]
+
+    for col_A, col_B in wave_pairs:
+        # Get values for pre (col_A) and post (col_B)
+        pre_vals = pd.to_numeric(df[col_A], errors="coerce").to_numpy(dtype=float)
+        post_vals = pd.to_numeric(df[col_B], errors="coerce").to_numpy(dtype=float)
+
+        # Treated profiling
+        t_pre = pre_vals[treated_idxs]
+        t_post = post_vals[treated_idxs]
+        t_diff = t_post - t_pre
+        t_valid = np.isfinite(t_diff)
+
+        t_inc = int(np.sum(t_diff[t_valid] > 0))
+        t_dec = int(np.sum(t_diff[t_valid] < 0))
+        t_same = int(np.sum(t_diff[t_valid] == 0))
+        t_total = int(np.sum(t_valid))
+
+        # Control profiling
+        c_pre = pre_vals[control_idxs]
+        c_post = post_vals[control_idxs]
+        c_diff = c_post - c_pre
+        c_valid = np.isfinite(c_diff)
+
+        c_inc = int(np.sum(c_diff[c_valid] > 0))
+        c_dec = int(np.sum(c_diff[c_valid] < 0))
+        c_same = int(np.sum(c_diff[c_valid] == 0))
+        c_total = int(np.sum(c_valid))
+
+        # Friendly label
+        friendly_name = col_A
+        if ":" in friendly_name:
+            friendly_name = friendly_name.split(":", 1)[1]
+        if "/A" in friendly_name:
+            friendly_name = friendly_name.replace("/A", "")
+        elif "-A" in friendly_name:
+            friendly_name = friendly_name.replace("-A", "")
+
+        # Clean up underscores/hyphens and capitalize
+        friendly_name = friendly_name.replace("_", " ").replace("-", " ").strip().title()
+
+        results.append({
+            "feature": friendly_name,
+            "col_pre": col_A,
+            "col_post": col_B,
+            "treated": {
+                "increased": t_inc,
+                "decreased": t_dec,
+                "no_change": t_same,
+                "total": t_total
+            },
+            "control": {
+                "increased": c_inc,
+                "decreased": c_dec,
+                "no_change": c_same,
+                "total": c_total
+            }
+        })
+    return results
+

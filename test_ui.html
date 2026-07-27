@@ -57,19 +57,47 @@
     word-break: break-word;
   }
   .status { font-size: 0.85rem; margin-top: 0.5rem; }
-  .status.ok { color: #16a34a; }
+  .status.ok  { color: #16a34a; }
   .status.err { color: #dc2626; }
   .muted { color: #8884; }
+
+  /* Profiling summary boxes */
+  .profiling-grid {
+    display: flex;
+    gap: 0.75rem;
+    flex-wrap: wrap;
+    margin: 0.75rem 0;
+  }
+  .prof-box {
+    border: 1px solid #8884;
+    border-radius: 6px;
+    padding: 0.6rem 1rem;
+    min-width: 130px;
+    text-align: center;
+  }
+  .prof-box .label { font-size: 0.78rem; color: #8884; margin-bottom: 0.2rem; }
+  .prof-box .value { font-size: 1.4rem; font-weight: 700; }
+  .prof-box.inc  .value { color: #16a34a; }
+  .prof-box.dec  .value { color: #dc2626; }
+  .prof-box.same .value { color: #64748b; }
+
+  /* Profile updates table */
+  .profile-table-wrap { overflow-x: auto; margin-top: 0.75rem; }
+  table { border-collapse: collapse; font-size: 0.82rem; width: 100%; }
+  th, td { border: 1px solid #8884; padding: 0.35rem 0.6rem; text-align: left; }
+  th { background: #0001; font-weight: 600; }
+  td.inc  { color: #16a34a; }
+  td.dec  { color: #dc2626; }
+  td.same { color: #64748b; }
 </style>
 </head>
 <body>
 
 <h1>BFAR ML &mdash; Dynamic Training Test UI</h1>
 <p class="muted">
-  Manual smoke-test harness for the "teachable machine" training flow:
-  upload a CSV, it gets sent to <code>POST /train</code>, which deletes
-  whatever dynamic model was active and fits a fresh one on this upload.
-  Not a production frontend -- see <code>README.md</code> for the integration guide.
+  Manual smoke-test harness for <code>POST /train</code>: upload a CSV, train a fresh
+  propensity-score model, and inspect the profiling results below. Not a production
+  frontend &mdash; see <code>README.md</code> for the integration guide.
 </p>
 
 <h2>Service status</h2>
@@ -82,36 +110,92 @@
 <div class="card">
   <label for="trainFile">CSV file</label>
   <input type="file" id="trainFile" accept=".csv">
-  <label for="treatmentCol">Treatment column (optional -- pick the file first to populate this)</label>
+  <label for="treatmentCol">Treatment column (optional &mdash; pick the file first to populate this)</label>
   <select id="treatmentCol">
     <option value="">Auto-detect (recommended)</option>
   </select>
   <button id="trainBtn">Train</button>
   <div id="trainStatus" class="status"></div>
-  <p class="muted">Training already scores every row of this same upload -- see <code>ps_output</code> in the response below; no separate scoring step needed.</p>
+  <p class="muted">Training already scores every row of this same upload &mdash; see <code>ps_output</code> in the response below; no separate scoring step needed.</p>
+</div>
+
+<!-- Profiling results (shown after a successful /train) -->
+<div id="profilingSection" style="display:none">
+
+  <h2>2. Income / Outcome Profiling</h2>
+  <div class="card">
+    <p style="font-size:0.85rem;margin-bottom:0.5rem">
+      Outcome column detected: <strong id="outcomeColUsed">&mdash;</strong>
+      &nbsp;&nbsp;|&nbsp;&nbsp;
+      Matched pairs: <strong id="matchedPairsVal">&mdash;</strong>
+      &nbsp;&nbsp;|&nbsp;&nbsp;
+      ATT (avg income effect): <strong id="attMeanVal">&mdash;</strong>
+      &nbsp;&nbsp;|&nbsp;&nbsp;
+      p-value: <strong id="pvalVal">&mdash;</strong>
+    </p>
+    <div class="profiling-grid" id="profilingGrid"></div>
+  </div>
+
+  <h2>3. Life Updates &mdash; Pre vs Post Program</h2>
+  <div class="card">
+    <p class="muted" style="font-size:0.82rem;margin-bottom:0.5rem">
+      For each before/after column pair detected in the dataset, this table shows how
+      many people in the matched <strong>Treated</strong> (beneficiary) group and
+      <strong>Control</strong> (matched comparable) group increased, stayed the same,
+      or decreased after the program.
+    </p>
+    <div class="profile-table-wrap">
+      <table id="profileTable">
+        <thead>
+          <tr>
+            <th rowspan="2">Feature</th>
+            <th rowspan="2">Before col</th>
+            <th rowspan="2">After col</th>
+            <th colspan="3" style="text-align:center">Treated (Beneficiaries)</th>
+            <th colspan="3" style="text-align:center">Control (Matched)</th>
+          </tr>
+          <tr>
+            <th class="inc">↑ Increased</th>
+            <th class="same">= Same</th>
+            <th class="dec">↓ Decreased</th>
+            <th class="inc">↑ Increased</th>
+            <th class="same">= Same</th>
+            <th class="dec">↓ Decreased</th>
+          </tr>
+        </thead>
+        <tbody id="profileTableBody"></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<h2>Raw API response</h2>
+<div class="card">
   <pre id="trainOut">(no response yet)</pre>
 </div>
 
 <script>
-const API_BASE = ""; // same-origin: served by app.py itself
+const API_BASE = "";
+
+function pct(n, total) {
+  if (!total) return "";
+  return " (" + Math.round(n / total * 100) + "%)";
+}
 
 async function loadHealth() {
   const out = document.getElementById("healthOut");
   out.textContent = "loading...";
   try {
-    const res = await fetch(`${API_BASE}/health`);
+    const res  = await fetch(`${API_BASE}/health`);
     const body = await res.json();
     out.textContent = JSON.stringify(body, null, 2);
   } catch (e) {
     out.textContent = "Error: " + e.message;
   }
 }
-
 document.getElementById("refreshHealth").addEventListener("click", loadHealth);
 loadHealth();
 
-// Naive CSV header split -- good enough for picking a column name out of a
-// header row; doesn't handle quoted fields containing commas.
 function parseCsvHeader(text) {
   const firstLine = text.split(/\r\n|\r|\n/, 1)[0] || "";
   return firstLine.split(",").map(h => h.trim().replace(/^"|"$/g, "")).filter(Boolean);
@@ -121,18 +205,16 @@ function populateTreatmentColumnOptions(headers) {
   const select = document.getElementById("treatmentCol");
   select.innerHTML = "";
   const autoOpt = document.createElement("option");
-  autoOpt.value = "";
-  autoOpt.textContent = "Auto-detect (recommended)";
+  autoOpt.value = ""; autoOpt.textContent = "Auto-detect (recommended)";
   select.appendChild(autoOpt);
   for (const h of headers) {
     const opt = document.createElement("option");
-    opt.value = h;
-    opt.textContent = h;
+    opt.value = h; opt.textContent = h;
     select.appendChild(opt);
   }
 }
 
-document.getElementById("trainFile").addEventListener("change", (e) => {
+document.getElementById("trainFile").addEventListener("change", e => {
   const file = e.target.files[0];
   const select = document.getElementById("treatmentCol");
   if (!file) {
@@ -142,14 +224,13 @@ document.getElementById("trainFile").addEventListener("change", (e) => {
   const reader = new FileReader();
   reader.onload = () => populateTreatmentColumnOptions(parseCsvHeader(reader.result));
   reader.onerror = () => populateTreatmentColumnOptions([]);
-  // First 4KB is always enough to cover a header row.
   reader.readAsText(file.slice(0, 4096));
 });
 
 document.getElementById("trainBtn").addEventListener("click", async () => {
-  const fileInput = document.getElementById("trainFile");
-  const status = document.getElementById("trainStatus");
-  const out = document.getElementById("trainOut");
+  const fileInput  = document.getElementById("trainFile");
+  const status     = document.getElementById("trainStatus");
+  const out        = document.getElementById("trainOut");
   const treatmentCol = document.getElementById("treatmentCol").value.trim();
 
   if (!fileInput.files.length) {
@@ -165,14 +246,19 @@ document.getElementById("trainBtn").addEventListener("click", async () => {
   status.textContent = "Training...";
   status.className = "status";
   out.textContent = "";
+  document.getElementById("profilingSection").style.display = "none";
 
   try {
-    const res = await fetch(`${API_BASE}/train`, { method: "POST", body: form });
+    const res  = await fetch(`${API_BASE}/train`, { method: "POST", body: form });
     const body = await res.json();
     out.textContent = JSON.stringify(body, null, 2);
+
     if (res.ok) {
-      status.textContent = `Trained on ${body.rows} rows -- treatment column "${body.treatment_column}" (${body.treatment_detection_method}), ${body.n_features_selected} features selected.`;
+      status.textContent =
+        `Trained on ${body.rows} rows -- treatment column "${body.treatment_column}" ` +
+        `(${body.treatment_detection_method}), ${body.n_features_selected} features selected.`;
       status.className = "status ok";
+      renderProfiling(body);
       loadHealth();
     } else {
       status.textContent = `Error (${res.status}): ${body.error || "unknown"}`;
@@ -183,7 +269,72 @@ document.getElementById("trainBtn").addEventListener("click", async () => {
     status.className = "status err";
   }
 });
-</script>
 
+function renderProfiling(body) {
+  const ps  = body.profiling_summary || {};
+  const att = body.att_result || {};
+
+  // Header stats
+  document.getElementById("outcomeColUsed").textContent = body.outcome_column || "—";
+  const pairs = att.matched_pairs != null ? att.matched_pairs
+    : ((ps.increased_count || 0) + (ps.decreased_count || 0) + (ps.no_change_count || 0));
+  document.getElementById("matchedPairsVal").textContent = pairs || "—";
+  document.getElementById("attMeanVal").textContent =
+    att.att_mean != null
+      ? Number(att.att_mean).toLocaleString(undefined, { maximumFractionDigits: 2 })
+      : "—";
+  document.getElementById("pvalVal").textContent =
+    att.p_value_paired_ttest != null
+      ? Number(att.p_value_paired_ttest).toFixed(4) +
+        (att.p_value_paired_ttest < 0.05 ? " (significant)" : " (not significant)")
+      : "—";
+
+  // Summary boxes
+  const total = (ps.increased_count || 0) + (ps.decreased_count || 0) + (ps.no_change_count || 0);
+  const grid  = document.getElementById("profilingGrid");
+  grid.innerHTML = "";
+  function box(cls, label, n) {
+    const d = document.createElement("div");
+    d.className = "prof-box " + cls;
+    d.innerHTML =
+      `<div class="label">${label}</div>` +
+      `<div class="value">${n != null ? n : "—"}</div>` +
+      (total && n != null ? `<div class="label">${Math.round(n / total * 100)}%</div>` : "");
+    grid.appendChild(d);
+  }
+  box("inc",  "↑ Income Increased", ps.increased_count);
+  box("same", "= No Change",        ps.no_change_count);
+  box("dec",  "↓ Income Decreased", ps.decreased_count);
+
+  // Life updates table
+  const updates = body.profile_updates || [];
+  const tbody   = document.getElementById("profileTableBody");
+  tbody.innerHTML = "";
+  if (!updates.length) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `<td colspan="9" style="text-align:center" class="muted">
+      No before/after wave-pair columns detected in this dataset.</td>`;
+    tbody.appendChild(tr);
+  } else {
+    for (const u of updates) {
+      const t = u.treated; const c = u.control;
+      const tr = document.createElement("tr");
+      tr.innerHTML =
+        `<td>${u.feature}</td>` +
+        `<td class="muted" style="font-size:0.78rem">${u.col_pre}</td>` +
+        `<td class="muted" style="font-size:0.78rem">${u.col_post}</td>` +
+        `<td class="inc">${t.increased}${pct(t.increased, t.total)}</td>` +
+        `<td class="same">${t.no_change}${pct(t.no_change, t.total)}</td>` +
+        `<td class="dec">${t.decreased}${pct(t.decreased, t.total)}</td>` +
+        `<td class="inc">${c.increased}${pct(c.increased, c.total)}</td>` +
+        `<td class="same">${c.no_change}${pct(c.no_change, c.total)}</td>` +
+        `<td class="dec">${c.decreased}${pct(c.decreased, c.total)}</td>`;
+      tbody.appendChild(tr);
+    }
+  }
+
+  document.getElementById("profilingSection").style.display = "";
+}
+</script>
 </body>
 </html>

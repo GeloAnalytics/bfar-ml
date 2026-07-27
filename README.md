@@ -179,7 +179,10 @@ After a `/train` call, `dynamic` instead looks like:
 ```bash
 curl -X POST http://localhost:8000/train -F "file=@mydataset.csv"
 ```
-Optional form field: `treatment_column=enrolled_flag` (bypasses auto-detection).
+Optional form fields: `treatment_column=enrolled_flag` (bypasses auto-detection);
+`outcome_column=monthly_income_after` (outcome for ATT estimation and profiling;
+auto-detected if omitted — prefers `C5:TOT_INCOME/B` for BFAR data, then any column
+containing "income" or "outcome", then the first usable numeric column).
 
 **If the uploaded CSV's column set exactly matches the columns that trained the
 currently active model, retraining is skipped** (`retrained: false`, `retrain_attempts: 0`)
@@ -212,6 +215,7 @@ is expected, not a bug.
   "rows": 412,
   "treatment_column": "enrolled",
   "treatment_detection_method": "binary_value",
+  "outcome_column": "monthly_income_after",
   "feature_selection": {
     "n_features_selected": 30,
     "selected": [{"feature": "monthly_income", "importance": 0.11}, "..."],
@@ -241,6 +245,23 @@ is expected, not a bug.
     "worst_feature": "household_size",
     "ipw": {"balance_achieved": true, "mean_abs_smd": 0.04, "n_features_over_threshold": 1, "max_unbalanced_features_allowed": 6, "trimmed_n": 398}
   },
+  "att_result": {
+    "matched_pairs": 180, "att_mean": 3200.0,
+    "ci_95": [1800.0, 4600.0], "p_value_paired_ttest": 0.003, "caliper": 0.24
+  },
+  "profiling_summary": {"increased_count": 142, "decreased_count": 21, "no_change_count": 17},
+  "profile_updates": [
+    {
+      "feature": "Tot Income",
+      "col_pre": "C1:TOT_INCOME/A", "col_post": "C5:TOT_INCOME/B",
+      "treated": {"increased": 142, "decreased": 21, "no_change": 17, "total": 180},
+      "control": {"increased": 98, "decreased": 47, "no_change": 35, "total": 180}
+    },
+    {"feature": "A Motorc", "col_pre": "D1.2:A_MOTORC", "col_post": "D1.2:B_MOTORC",
+     "treated": {"increased": 65, "decreased": 3, "no_change": 112, "total": 180},
+     "control": {"increased": 22, "decreased": 8, "no_change": 150, "total": 180}},
+    "..."
+  ],
   "model_interpretation": {
     "method": "SHAP (shap.TreeExplainer, exact for tree-ensemble models) ...",
     "n_features_ranked": 30,
@@ -264,16 +285,26 @@ count-based bar. The matched-pairs result is still reported separately as
 The count-based bar is true if no more than 25% of features
 (`max_unbalanced_features_allowed`) individually exceed |SMD| `>= 0.1`
 (`n_features_over_threshold`), not a requirement that the *average* across every
-feature stays low -- `psm_core.covariate_balance`. `model_interpretation` (step 9) is real SHAP values
-(`psm_core.compute_shap_feature_contributions`, `shap.TreeExplainer` -- exact for tree
-ensembles, not approximated): mean absolute SHAP value per feature across every row in
-this upload (not a per-row breakdown, to keep the response a reasonable size), the
-signed mean (which direction the feature pushes predictions), and
-`socioeconomic_insights` -- generic template sentences built from the top-ranked
-features, not tied to any one program's naming scheme. SHAP values are in the model's
-raw log-odds space, not probability space. `decision_support` (step 10) is the same
-PS-quartile table `/train/predict_ps_batch` returns, computed in-sample on the
-training upload itself.
+feature stays low -- `psm_core.covariate_balance`. `model_interpretation` (step 9) is
+real SHAP values (`psm_core.compute_shap_feature_contributions`, `shap.TreeExplainer`
+-- exact for tree ensembles, not approximated): mean absolute SHAP value per feature
+across every row in this upload (not a per-row breakdown), the signed mean (which
+direction the feature pushes predictions), and `socioeconomic_insights` -- generic
+template sentences built from the top-ranked features' names and directions, not tied
+to any one program's naming scheme. SHAP values are in the model's raw log-odds space,
+not probability space. `decision_support` (step 10) is the PS-quartile table
+`/train/predict_ps_batch` returns, computed in-sample on the training upload itself.
+
+**Livelihood profiling** (`att_result`, `profiling_summary`, `profile_updates`): after
+training, `/train` auto-detects or uses the `outcome_column` form field to identify the
+primary outcome (e.g. total income after the program), runs 1-NN matched-pair ATT
+estimation against it (see `att_result` -- mean treatment effect, 95% CI, p-value),
+and tallies Increased/Decreased/No Change for both the treated group and their matched
+controls across every detected before/after wave-pair column (`profile_updates`, see
+`psm_core.find_wave_pairs`). On `bfar.csv` this covers 58 wave pairs -- income,
+vehicles, appliances, gadgets, utilities, housing, and insurance. The dashboard at
+`http://localhost:8000/` surfaces all of this visually with KPI cards and categorized
+tabs showing treated vs control stacked bars for every feature.
 
 ### Predict propensity scores (JSON records)
 ```bash
@@ -310,8 +341,8 @@ curl -X POST http://localhost:8000/train/estimate_att \
     "caliper_ratio": 0.2, "n_bootstrap": 200, "seed": 42
   }'
 ```
-Returns `matched_pairs`, `att_mean`, `ci_95`, `p_value_paired_ttest`, `caliper`, plus
-`source`/`n_features_used`. The `outcome` column is never treated as a candidate
+Returns `matched_pairs`, `att_mean`, `ci_95`, `p_value_paired_ttest`, `caliper`, `pair_profiles`, `profiling_summary`, plus
+`source`/`n_features_used`. The `pair_profiles` array provides detailed information for every matched pair (original row indices, outcomes, outcome difference, and an "Increased"/"Decreased"/"No Change" status) to let integrators easily map results back to individual participants. The `outcome` column is never treated as a candidate
 feature. Optional body fields: `treatmentKey` (default `"treatment"`), `outcomeKey`
 (default `"outcome"`), `caliper_ratio`, `n_bootstrap`, `seed`.
 

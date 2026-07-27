@@ -14,6 +14,15 @@ structural detector first (a correctness fix -- post-treatment data as a PS
 predictor), then the demographic-keyword and low-coverage filters on top of it (see
 below). Still no manual exclude_columns/include_columns overrides.
 
+Latest addition: **livelihood profiling and program impact dashboard**. `/train`
+now auto-detects or accepts an explicit `outcome_column` form field, runs matched-pair
+ATT estimation against it, and computes pre-post change profiles across every detected
+before/after wave-pair column for both the treated group and their matched controls
+(`profile_updates`). `test_ui.html` has been redesigned as a dark-mode program impact
+dashboard with KPI cards, an outcome-change summary, and categorized tabs (Income,
+Assets, Appliances, Gadgets, Utilities, Housing, Insurance) each showing treated vs
+control stacked progress bars for every wave-pair feature.
+
 ## 1. Architecture
 
 One process (`app.py`), two independent Flask servers, sharing `psm_core.py` and the
@@ -67,11 +76,13 @@ whether the model changed.
 1. Auto-detect the treatment/control column (`psm_core.detect_treatment_column`;
    override via `treatment_column` form field). `test_ui.html`'s train form exposes
    this as a `<select>` dropdown: picking a CSV file parses just its header row
-   client-side (`FileReader`, first 4KB) and populates the dropdown with the actual
+   client-side (`FileReader`, first 8KB) and populates the dropdown with the actual
    column names, defaulting to "Auto-detect" -- no need to already know or type the
-   exact column name. Confirmed end-to-end: selecting a column other than the
-   auto-detector's obvious pick still submits `treatment_column` and the response
-   comes back with `treatment_detection_method: "manual_override"` for that column.
+   exact column name. A separate **outcome column** dropdown works the same way:
+   override via the `outcome_column` form field or let the auto-detector pick
+   (`psm_core.detect_outcome_column` -- prefers `C5:TOT_INCOME/B` for BFAR data, then
+   keyword-matches "income"/"outcome" in column names, then falls back to the first
+   usable numeric non-treatment column).
 2. Narrow numeric, non-ID-like candidate columns through three filters, in order (each
    reported separately in `feature_selection`):
    - **Demographic/respondent-identity keyword match**
@@ -159,6 +170,7 @@ normal, not a bug -- one counts people, the other counts predictor columns.
   "rows": int,
   "treatment_column": str,
   "treatment_detection_method": str,
+  "outcome_column": str,             # auto-detected or the override passed in the form
   # Describes COLUMNS (features) -- list lengths here are feature counts,
   # unrelated to how many rows were uploaded.
   "feature_selection": {             # pipeline step 3, surfaced explicitly
@@ -188,6 +200,30 @@ normal, not a bug -- one counts people, the other counts predictor columns.
     "per_feature": [{"feature", "smd_before", "smd_after"}, ...],
     "worst_feature": str
   },
+  # ATT estimate from 1-NN caliper matching on the outcome column. Excludes
+  # pair_profiles and profiling_summary (kept as top-level fields separately).
+  "att_result": {                    # step 8 — in-sample ATT on this upload
+    "matched_pairs": int,
+    "att_mean": float,
+    "ci_95": [float, float],
+    "p_value_paired_ttest": float,
+    "caliper": float
+  },
+  # Per-matched-pair outcome detail (row indices + outcome values + status).
+  "pair_profiles": [{"treated_index", "control_index", "treated_outcome",
+                     "control_outcome", "outcome_difference", "status"}, ...],
+  # Aggregate tally of outcome-change direction across all matched pairs.
+  "profiling_summary": {"increased_count": int, "decreased_count": int, "no_change_count": int},
+  # Pre-post change profile for EVERY detected wave-pair column (psm_core.find_wave_pairs),
+  # for both the treated group and their matched controls. Each entry covers one
+  # before/after pair, e.g. C1:TOT_INCOME/A -> C5:TOT_INCOME/B.
+  "profile_updates": [{
+    "feature": str,                  # human-friendly label derived from the pre-column name
+    "col_pre": str,                  # original before-program column name
+    "col_post": str,                 # original after-program column name
+    "treated": {"increased": int, "decreased": int, "no_change": int, "total": int},
+    "control": {"increased": int, "decreased": int, "no_change": int, "total": int}
+  }, ...],
   # Also describes COLUMNS, not rows -- a ranking of which features drove
   # the model's predictions. n_features_ranked is a different number from
   # ps_output.n_rows_scored above: one counts respondents, the other counts
@@ -198,7 +234,7 @@ normal, not a bug -- one counts people, the other counts predictor columns.
     "feature_contributions": [
       {"feature": str, "mean_abs_shap": float, "mean_shap": float, "direction": "increases_likelihood"|"decreases_likelihood"}, ...
     ],
-    "socioeconomic_insights": [str, ...]   # plain-language, generated from the top 5 by default -- always fewer than n_features_ranked once there are more than 5 features; the sentences themselves state "feature #N of 5 shown (... out of {n_features_ranked} features total)" so the two counts are never confused with each other or with row counts
+    "socioeconomic_insights": [str, ...]   # plain-language, top 5 by default
   },
   "decision_support": [{"ps_group", "count", "interpretation", "mean_*"}, ...],  # step 10
   # kept for backwards compatibility with pre-upgrade callers:
@@ -226,8 +262,19 @@ produced (never the frozen baseline, even if a request covers all 57 raw columns
 `409` if nothing has been trained yet). Static-port equivalents remain baseline-only,
 unconditionally, on their own port. `/estimate_att` (`psm_core.matched_att`, built on the
 shared `psm_core._match_pairs` helper) does 1-NN caliper matching + paired t-test +
-bootstrap CI. `/predict_ps_batch` (`psm_core.decision_support_table`) stratifies into
-PS quartiles.
+bootstrap CI. Returns `pair_profiles` (detailed stats per matched pair) and a
+`profiling_summary` tallying Increased/Decreased/No Change outcomes.
+
+**Livelihood profiling (new, in-train only).** `POST /train` now also runs
+`psm_core.detect_outcome_column` to identify or accept the outcome column, computes
+`matched_att` against it in-train, and then calls `psm_core.find_wave_pairs` +
+`psm_core.compute_wave_pair_profiling` to produce `profile_updates`: a list of
+before/after change stats for every detected wave-pair column (58 detected on `bfar.csv`)
+for both the matched treated group and their matched control group. This makes it
+possible to see, for each life-quality indicator (income, motorcycle ownership, appliance
+acquisition, insurance uptake, etc.), how many beneficiaries improved, stayed the same,
+or fell back -- relative to what happened to comparable non-beneficiaries over the same
+period. `/predict_ps_batch` (`psm_core.decision_support_table`) stratifies into PS quartiles.
 
 ## 6. Current endpoints
 
@@ -251,7 +298,7 @@ PS quartiles.
 | 7. Covariate balance diagnostics | ✅ `covariate_balance` in `/train`'s response (SMD, overlap, balance_achieved + auto re-tune) |
 | 8. Causal estimation (matching/ATT) | ✅ `/train/estimate_att` (and static `/estimate_att`) |
 | 9. Model interpretation | ✅ `model_interpretation` in `/train`'s response -- real SHAP values (`shap.TreeExplainer`) plus generated socioeconomic insights |
-| 10. Decision support system | ⚠️ `decision_support` quartile table (in `/train` and `/train/predict_ps_batch`); no generated reports or visualizations beyond the raw table |
+| 10. Decision support system | ✅ `decision_support` quartile table + `profile_updates` (Treated vs Control Increased/Decreased/No Change per wave-pair column) + dark-mode program impact dashboard (`test_ui.html`) with KPI cards and categorized tabs |
 
 ## 8. Known limitations
 
@@ -269,3 +316,11 @@ PS quartiles.
   structurally pair against. A "current wave" column with no such counterpart (e.g.
   bfar.csv's `C2:INCOME/B/FISH`) has no generic signal indicating it's post-treatment
   and will still be used as a candidate.
+- `profile_updates` is computed only in-train (on `/train`'s own upload); it is not
+  available from `/train/estimate_att` (which works on arbitrary JSON records that
+  may not contain wave-pair columns). For a per-record ATT call, the matched-pair
+  outcome change direction is still available in `pair_profiles` + `profiling_summary`.
+- `psm_core.find_wave_pairs` uses a prefix-stripping heuristic that correctly handles
+  BFAR's `C1:TOT_INCOME/A` / `C5:TOT_INCOME/B` case (different prefix, matched via
+  core-name token swap). If a dataset uses a naming scheme where the section prefix
+  itself changes between waves (not just the A/B token), some pairs may not be detected.
